@@ -1238,6 +1238,52 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=30_000,
     ),
+    # pi05_yam_multitask_all — the 9-task YAM finetune (dgx12, 60k steps, FSDP 4). Transplanted from the
+    # TRAINING checkout (~/rfm_rl/dsrl_openpi @ f08d5b5 on dgx12): same SimpleDataConfig + YAMInputs/Outputs,
+    # action_horizon=10, asset_id pi05_yam_multitask_all (norm_stats under assets/pi05_yam_multitask_all/).
+    # Serving-side edits only: pi0_config.Pi0Config import name; no DataConfig(local_files_only=) (field gone).
+    TrainConfig(
+        name="pi05_yam_multitask_all",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/yam_multitask_all",
+            assets=AssetsConfig(asset_id="pi05_yam_multitask_all"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=60_000,
+    ),
     TrainConfig(
         name="pi05_yam_blockstack",
         # Finetune pi05 on the BlockOnBlock YAM dataset (repo_id local/blockstack_yam, 14-D bimanual,
