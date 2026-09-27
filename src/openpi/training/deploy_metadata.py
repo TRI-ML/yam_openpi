@@ -136,8 +136,10 @@ def config_from_sidecar(step_dir: pathlib.Path | str):
     data = _config.SimpleDataConfig(
         repo_id=(meta.get("dataset") or {}).get("repo_id") or f"local/{name}",
         assets=_config.AssetsConfig(asset_id=asset_id),
-        data_transforms=lambda model: _transforms.Group(
-            inputs=[yam_policy.YAMInputs(model_type=model.model_type)], outputs=[yam_policy.YAMOutputs()]),
+        # delta recipes (sidecar action_space delta_*): the server must apply the same DeltaActions/AbsoluteActions
+        # pair the run trained with, or the normalised joint deltas get served as absolute targets.
+        data_transforms=lambda model: _config._yam_data_transforms(
+            model, use_delta_joint_actions=str(meta.get("action_space") or "").startswith("delta")),
         base_config=_config.DataConfig(
             repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(dict(REPACK))]),
             prompt_from_task=True, action_sequence_keys=("action",)),
