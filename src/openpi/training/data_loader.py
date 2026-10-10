@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -127,6 +128,73 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class YamLeRobotDataset(lerobot_dataset.LeRobotDataset):
+    """LeRobot v2.1 dataset with two scale fixes for the YAM pretraining repos (10^8+ frames, 100+ parquet shards):
+
+    * **lowdim memmaps** (`LEROBOT_LOWDIM_MEMMAP`, default on): `_query_hf_dataset` (the per-sample state/action
+      window lookup) costs ~2.7 s/sample through `hf_dataset.select()` on a 463M-frame table (it deep-copies the
+      dataset info and rebuilds the shard schema per call). When `<root>/lowdim_mm/<key>.npy` exist (written by
+      `yam/pretrain/build_lowdim_memmap.py`, float32 in global frame order) the window is read from the memmap
+      instead: 0.12 s/sample, bit-exact with the parquet values. Repos without memmaps behave exactly as before.
+    * **download_checksums** are dropped from the loaded HF dataset info (a 163k-entry dict deep-copied on every
+      select); they are only needed for HF Hub pushes.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        info = getattr(self.hf_dataset, "_info", None)
+        if info is not None and getattr(info, "download_checksums", None):
+            info.download_checksums = None
+        self._yam_lowdim_mm: dict | None = None
+
+    def _lowdim_memmaps(self) -> dict:
+        if getattr(self, "_yam_lowdim_mm", None) is None:
+            mm = {}
+            if os.environ.get("LEROBOT_LOWDIM_MEMMAP", "1") == "1":
+                d = pathlib.Path(self.root) / "lowdim_mm"
+                for f in sorted(d.glob("*.npy")):
+                    try:
+                        mm[f.stem] = np.load(f, mmap_mode="r")
+                    except Exception as e:
+                        logging.warning(f"lowdim memmap {f} unusable, falling back to parquet: {e}")
+                if mm:
+                    logging.info(f"lowdim memmaps for {sorted(mm)} from {d}")
+            self._yam_lowdim_mm = mm
+        return self._yam_lowdim_mm
+
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        mm = self._lowdim_memmaps()
+        if mm and all(k in mm for k in query_indices):
+            return {
+                key: torch.from_numpy(np.ascontiguousarray(mm[key][np.asarray(idx, dtype=np.int64)]))
+                for key, idx in query_indices.items()
+            }
+        return super()._query_hf_dataset(query_indices)
+
+
+def make_lerobot_dataset(
+    repo_id: str, *, delta_timestamps: dict | None = None, **kwargs
+) -> lerobot_dataset.LeRobotDataset:
+    """Construct the (patched) LeRobot dataset the way training and norm-stats both need it.
+
+    `LEROBOT_SKIP_TS_CHECK=1` skips lerobot's constructor-time timestamp sync check, which materialises every
+    timestamp through the per-row torch transform (hours at 10^8 frames). Our assembled repos have exact
+    frame_index/fps timestamps by construction (yam/pretrain/assemble_v21.py), so the check is redundant there.
+    Only ever set it for repos you built that way. `video_backend` defaults to pyav: the DGX nodes lack the ffmpeg
+    libs torchcodec needs, and pyav decodes AV1 via libdav1d.
+    """
+    kwargs.setdefault("video_backend", "pyav")
+    skip_ts = os.environ.get("LEROBOT_SKIP_TS_CHECK") == "1"
+    orig = lerobot_dataset.check_timestamps_sync
+    if skip_ts:
+        logging.warning("LEROBOT_SKIP_TS_CHECK=1: skipping lerobot's timestamp sync check for %s", repo_id)
+        lerobot_dataset.check_timestamps_sync = lambda *a, **k: True
+    try:
+        return YamLeRobotDataset(repo_id, delta_timestamps=delta_timestamps, **kwargs)
+    finally:
+        lerobot_dataset.check_timestamps_sync = orig
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -138,7 +206,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset = make_lerobot_dataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
@@ -306,6 +374,18 @@ def create_torch_data_loader(
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
     sampler = None
+    if framework == "jax" and jax.process_count() > 1:
+        # Multi-host JAX: each process loads a DISJOINT 1/N slice of the dataset (reshuffled every epoch via
+        # set_epoch in TorchDataLoader.__iter__); the per-process arrays are assembled into one global batch by
+        # jax.make_array_from_process_local_data below.
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=jax.process_count(),
+            rank=jax.process_index(),
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=True,
+        )
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -409,8 +489,9 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        # multi-host JAX is supported via a DistributedSampler (see create_torch_data_loader)
+        self._sampler = sampler
+        self._epoch = 0
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
@@ -452,6 +533,9 @@ class TorchDataLoader:
     def __iter__(self):
         num_items = 0
         while True:
+            if getattr(self, "_sampler", None) is not None and hasattr(self._sampler, "set_epoch"):
+                self._sampler.set_epoch(self._epoch)
+            self._epoch += 1
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:

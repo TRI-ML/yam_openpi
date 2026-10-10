@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import http
 import logging
+import signal
 import time
 import traceback
 
@@ -24,17 +26,31 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int | None = None,
         metadata: dict | None = None,
+        name: str | None = None,
     ) -> None:
         self._policy = policy
         self._host = host
         self._port = port
         self._metadata = metadata or {}
-        logging.getLogger("websockets.server").setLevel(logging.INFO)
+        self._name = name or "policy"
+        self._stop: asyncio.Event | None = None
+        ws_logger = logging.getLogger("websockets.server")
+        ws_logger.setLevel(logging.INFO)
+        # yam_eval's VibeManager health-checks the port by opening a bare TCP connection and closing it; websockets
+        # logs every such probe as an "opening handshake failed" ERROR with an EOFError traceback. Drop those.
+        ws_logger.addFilter(_QuietProbeFilter())
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
     async def run(self):
+        loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        # Graceful shutdown: yam_eval restarts serve_policy on every policy/variant switch with SIGTERM; exit 0 instead
+        # of dying mid-request with a traceback.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError):  # non-main thread / no signal support
+                loop.add_signal_handler(sig, self._request_stop, sig.name)
         async with _server.serve(
             self._handler,
             self._host,
@@ -42,8 +58,22 @@ class WebsocketPolicyServer:
             compression=None,
             max_size=None,
             process_request=_health_check,
-        ) as server:
-            await server.serve_forever()
+        ):
+            logger.info(
+                "READY: %s serving on %s:%s (action_horizon=%s, action_dim=%s); health check GET /healthz",
+                self._name,
+                self._host,
+                self._port,
+                self._metadata.get("action_horizon", "?"),
+                self._metadata.get("action_dim", "?"),
+            )
+            await self._stop.wait()
+        logger.info("%s server on port %s stopped cleanly", self._name, self._port)
+
+    def _request_stop(self, signame: str) -> None:
+        logger.info("received %s: shutting down the policy server", signame)
+        if self._stop is not None:
+            self._stop.set()
 
     async def _handler(self, websocket: _server.ServerConnection):
         logger.info(f"Connection from {websocket.remote_address} opened")
@@ -97,6 +127,24 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+
+class _QuietProbeFilter(logging.Filter):
+    """Drop websockets' handshake-failure records caused by bare TCP liveness probes (connect + close, no HTTP)."""
+
+    _NOISE = (
+        "connection closed while reading HTTP request line",
+        "stream ends after 0 bytes",
+        "opening handshake failed",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = record.getMessage()
+        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
+        noisy = (
+            isinstance(exc, EOFError) or any(n in text for n in self._NOISE) or any(n in str(exc) for n in self._NOISE)
+        )
+        return not noisy
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

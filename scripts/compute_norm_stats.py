@@ -18,7 +18,9 @@ import openpi.transforms as transforms
 
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
-        return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+        # Images are irrelevant to state/action stats and their widths can differ per source (e.g. YAM ABC-130k 256x352..448
+        # vs MolmoAct2 256x448 in one repo), which would break collation: drop them.
+        return {k: v for k, v in x.items() if k not in ("image", "image_mask") and not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
 def create_torch_dataloader(

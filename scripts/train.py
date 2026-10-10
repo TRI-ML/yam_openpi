@@ -28,6 +28,29 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
+def maybe_init_distributed():
+    """Multi-host: one JAX process per node (OPENPI_NPROC>1). Must run before any other jax call."""
+    import os
+
+    n = int(os.environ.get("OPENPI_NPROC", "1"))
+    if n <= 1:
+        return
+    jax.distributed.initialize(
+        coordinator_address=os.environ["OPENPI_COORD_ADDR"],
+        num_processes=n,
+        process_id=int(os.environ["OPENPI_PROC_ID"]),
+        local_device_ids=list(range(int(os.environ.get("OPENPI_LOCAL_DEVICES", "8")))),
+    )
+    logging.info(
+        f"jax.distributed: process {jax.process_index()}/{jax.process_count()} "
+        f"local_devices={jax.local_device_count()} global_devices={jax.device_count()}"
+    )
+
+
+def is_main_process() -> bool:
+    return jax.process_index() == 0
+
+
 def init_logging():
     """Custom logging format for better readability."""
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -193,6 +216,7 @@ def train_step(
 
 def main(config: _config.TrainConfig):
     init_logging()
+    maybe_init_distributed()
     logging.info(f"Running on: {platform.node()}")
 
     if config.batch_size % jax.device_count() != 0:
@@ -215,7 +239,7 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and is_main_process())
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -227,11 +251,23 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    def _local(x):  # this process's first addressable shard (== the whole array on a single host)
+        return np.asarray(x.addressable_shards[0].data) if hasattr(x, "addressable_shards") else np.asarray(x)
+
+    local_imgs = {k: _local(v) for k, v in batch[0].images.items()}
+    # multi-host data check: every process should see a DIFFERENT local batch (hash printed per process)
+    import hashlib
+
+    act_hash = hashlib.sha1(_local(batch[1]).tobytes()).hexdigest()[:12]
+    logging.info(
+        f"[multihost-check] process {jax.process_index()} local actions shape {_local(batch[1]).shape} sha1 {act_hash}"
+    )
+    if is_main_process():
+        images_to_log = [
+            wandb.Image(np.concatenate([img[i] for img in local_imgs.values()], axis=1))
+            for i in range(min(5, len(next(iter(local_imgs.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -253,8 +289,43 @@ def main(config: _config.TrainConfig):
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
+        disable=not is_main_process(),
     )
 
+    # Telemetry: dataset composition once (YAM_ASSEMBLY_JSON from yam/pretrain/assemble_v21.py) + perf/* every log interval.
+    import json as _json
+    import os as _os
+    import time as _time
+
+    _asm = _os.environ.get("YAM_ASSEMBLY_JSON")
+    if _asm and _os.path.exists(_asm) and is_main_process() and wandb.run is not None:
+        with open(_asm) as _f:
+            _a = _json.load(_f)
+        _src = _a.get("sources", {})
+        _comp = {
+            "dataset/total_episodes": _a.get("total_episodes"),
+            "dataset/total_frames": _a.get("total_frames"),
+            "dataset/total_tasks": _a.get("total_tasks"),
+            "dataset/num_sources": len(_src),
+            "dataset/molmo_episodes": _src.get("molmo_yam_v3", {}).get("episodes", 0),
+            "dataset/molmo_frames": _src.get("molmo_yam_v3", {}).get("frames", 0),
+            "dataset/abc_episodes": sum(v["episodes"] for k, v in _src.items() if k != "molmo_yam_v3"),
+            "dataset/abc_frames": sum(v["frames"] for k, v in _src.items() if k != "molmo_yam_v3"),
+        }
+        wandb.run.summary.update(_comp)
+        wandb.log(_comp, step=start_step)
+        wandb.config.update(
+            {
+                "dataset_sources": {
+                    k: {kk: vv for kk, vv in v.items() if kk != "source_episode_ids"} for k, v in _src.items()
+                },
+                "dataset_dropped": _a.get("dropped", {}),
+            },
+            allow_val_change=True,
+        )
+        logging.info(f"dataset composition: {_comp}")
+    _t_prev = _time.monotonic()
+    _loader_wait = 0.0
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
@@ -264,10 +335,31 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            if is_main_process():
+                pbar.write(f"Step {step}: {info_str}")
+            _now = _time.monotonic()
+            _n = config.log_interval if step > start_step else 1
+            _step_t = (_now - _t_prev) / _n
+            try:
+                _mem = max(d.memory_stats()["bytes_in_use"] for d in jax.local_devices()) / 2**30
+            except Exception:
+                _mem = float("nan")
+            reduced_info.update(
+                {
+                    "perf/step_time_s": _step_t,
+                    "perf/samples_per_s": config.batch_size / _step_t if _step_t > 0 else 0.0,
+                    "perf/loader_wait_s": _loader_wait / _n,
+                    "perf/gpu_mem_max_gb": _mem,
+                }
+            )
+            _t_prev = _now
+            _loader_wait = 0.0
+            if is_main_process():
+                wandb.log(reduced_info, step=step)
             infos = []
+        _t0 = _time.monotonic()
         batch = next(data_iter)
+        _loader_wait += _time.monotonic() - _t0
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

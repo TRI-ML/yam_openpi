@@ -118,8 +118,29 @@ def create_policy(args: Args) -> _policy.Policy:
         logging.info("RTC enabled: %s", rtc)
     match args.policy:
         case Checkpoint():
+            try:
+                train_config = _config.get_config(args.policy.config)
+            except ValueError as e:
+                # not registered on this host: rebuild the config from the checkpoint's own sidecar
+                import openpi.training.deploy_metadata as _deploy_metadata
+                try:
+                    train_config = _deploy_metadata.config_from_sidecar(args.policy.dir)
+                except (FileNotFoundError, ValueError) as e2:
+                    yam = sorted(n for n in _config._CONFIGS if "yam" in n)  # noqa: SLF001
+                    raise SystemExit(
+                        f"serve_policy: config {args.policy.config!r} is not registered in this checkout ({e}) and "
+                        f"{args.policy.dir}/deploy_metadata.json cannot stand in for it ({e2}). Pull a checkout that has "
+                        f"the config or write the sidecar with scripts/write_deploy_sidecar.py. YAM configs here: {yam}"
+                    ) from e2
+                logging.warning("config %r not registered here (%s); serving from %s/deploy_metadata.json",
+                                args.policy.config, e, args.policy.dir)
+            logging.info(
+                "serving config=%s ckpt=%s action_horizon=%s norm_stats=%s",
+                train_config.name, args.policy.dir, train_config.model.action_horizon,
+                os.path.join(args.policy.dir, "assets", train_config.data.assets.asset_id or train_config.data.repo_id or ""),
+            )
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt, rtc=rtc
+                train_config, args.policy.dir, default_prompt=args.default_prompt, rtc=rtc
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
@@ -127,7 +148,17 @@ def create_policy(args: Args) -> _policy.Policy:
 
 def main(args: Args) -> None:
     policy = create_policy(args)
-    policy_metadata = policy.metadata
+    policy_metadata = dict(policy.metadata or {})
+    if isinstance(args.policy, Checkpoint):
+        # advertise what is being served (the YAM runner learns chunk_len from the first reply; this is for logs/UIs)
+        policy_metadata.setdefault("config", args.policy.config)
+        policy_metadata.setdefault("checkpoint_dir", args.policy.dir)
+        try:
+            cfg = _config.get_config(args.policy.config)
+            policy_metadata.setdefault("action_horizon", int(cfg.model.action_horizon))
+            policy_metadata.setdefault("action_dim", 14)
+        except ValueError:
+            pass
 
     # Record the policy's behavior.
     if args.record:
@@ -137,11 +168,13 @@ def main(args: Args) -> None:
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
 
+    name = args.policy.config if isinstance(args.policy, Checkpoint) else f"default:{args.env.value}"
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
         host="0.0.0.0",
         port=args.port,
         metadata=policy_metadata,
+        name=name,
     )
     server.serve_forever()
 

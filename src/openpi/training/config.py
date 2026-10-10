@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -277,6 +278,30 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
         )
+
+
+def _yam_data_transforms(model_config: _model.BaseModelConfig, *, use_delta_joint_actions: bool = False) -> _transforms.Group:
+    """Build the YAM (14D bimanual) data transforms.
+
+    When ``use_delta_joint_actions`` is True, the 6 joint dims of each arm are converted to deltas
+    w.r.t. the current state on input (DeltaActions) and reconstructed to absolute on output
+    (AbsoluteActions); the gripper dim of each arm stays absolute. Mask = make_bool_mask(6, -1, 6, -1)
+    over the 14D [l_joints(6), l_gripper(1), r_joints(6), r_gripper(1)] action vector. This is the
+    inverse pair that keeps train and serve consistent and prevents the pi05 proprio-copycat failure
+    (absolute action[t] ~= state[t] collapses the model onto copying proprio). Ported from the
+    training fork commit 1453cd766fb4 (the *_full30k_delta checkpoints were trained with it).
+    """
+    group = _transforms.Group(
+        inputs=[yam_policy.YAMInputs(model_type=model_config.model_type)],
+        outputs=[yam_policy.YAMOutputs()],
+    )
+    if use_delta_joint_actions:
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        group = group.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+    return group
 
 
 @dataclasses.dataclass(frozen=True)
@@ -805,6 +830,190 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
+    # YAM pretraining on public bimanual-YAM data (docs/YAM_PRETRAIN.md): Zheyuan's LeRobot v3.0 reprocessing of ABC-130k
+    # (abc130k_v3ar, 201 tasks, 256x416) + MolmoAct2-BimanualYAM (molmo_yam_v3ar, 256x448), converted losslessly to ONE
+    # LeRobot v2.1 repo by yam/pretrain/{convert_source,assemble_v21}.py (14-D absolute joints promoted from joint_action /
+    # joint_state; grippers 0..1, 1 = open). Val repo = ABC official val + the 323 MolmoAct2 webbed-val episodes.
+    # Full-parameter pi05 from pi05_base, action_horizon 32 (= the Cosmos3 WAM chunk at 30 Hz), bf16, FSDP over 8 GPUs.
+    #
+    # single node (8xH100 / 8xA100-80GB): batch 128, 200k steps = 25.6M samples. SageMaker run pi05_full_yam_abc_mm2_h32_sm_p5.
+    TrainConfig(
+        name="pi05_yam_abc_mm2_h32",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=SimpleDataConfig(
+            repo_id="local/abc_mm2_train_v21",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        log_interval=50,
+        batch_size=128,
+        num_workers=32,
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=200_000, decay_lr=2.5e-6),
+        num_train_steps=200_000,
+        save_interval=10_000,
+        keep_period=50_000,
+    ),
+    # 3-node JAX multi-host variant (dgx02+dgx03+dgx06, 24xA100; yam/multihost/launch_multihost.sh): global batch 384
+    # = 128/node, 66,700 steps = the same 25.6M samples. DGX run pi05_full_yam_abc_mm2_h32_dgx3node.
+    TrainConfig(
+        name="pi05_yam_abc_mm2_h32_3node",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=SimpleDataConfig(
+            repo_id="local/abc_mm2_train_v21",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        log_interval=50,
+        batch_size=384,
+        num_workers=32,
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=66_700, decay_lr=2.5e-6),
+        num_train_steps=66_700,
+        save_interval=5_000,
+        keep_period=25_000,
+    ),
+    # Smoke twin (LoRA, fits one 48 GB card): same data contract on a small assembled subset repo. yam/sagemaker/sm_entry.sh MODE=smoke.
+    TrainConfig(
+        name="pi05_yam_abc_mm2_h32_smoke",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=SimpleDataConfig(
+            repo_id="local/abc_mm2_smoke_v21",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        batch_size=8,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=10, peak_lr=2.5e-5, decay_steps=200, decay_lr=2.5e-6),
+        num_train_steps=200,
+        save_interval=10,
+        keep_period=10,
+        log_interval=5,
+        wandb_enabled=False,
+    ),
+    # Fine-tune TEMPLATE from a YAM pretrain checkpoint onto one of our station LeRobot v2.1 repos (yam-data materialization,
+    # cameras scene/left_wrist/right_wrist as observation.images.<camera>). Point the weight loader at a pretrain `params`
+    # dir (env YAM_PRETRAIN_PARAMS, e.g. s3://.../pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66700/params downloaded
+    # locally) and keep the PRETRAIN norm stats via AssetsConfig(assets_dir=<that checkpoint>/assets, asset_id=local/abc_mm2_train_v21)
+    # so the action scaling the head learned is preserved (docs/YAM_PRETRAIN.md "Fine-tuning"). Horizon stays 32.
+    TrainConfig(
+        name="pi05_yam_abc_mm2_h32_ft",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=SimpleDataConfig(
+            repo_id=os.environ.get("YAM_FT_REPO_ID", "local/placeteabag_yam"),
+            assets=AssetsConfig(assets_dir=os.environ.get("YAM_PRETRAIN_ASSETS_DIR"), asset_id="local/abc_mm2_train_v21"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(os.environ.get("YAM_PRETRAIN_PARAMS", "gs://openpi-assets/checkpoints/pi05_base/params")),
+        batch_size=32,
+        num_workers=16,
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=2.5e-5, decay_steps=15_000, decay_lr=2.5e-6),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        log_interval=50,
+    ),
+    #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
@@ -1137,50 +1346,6 @@ _CONFIGS = [
         ema_decay=0.999,
         num_train_steps=30_000,
     ),
-    # pi05 finetune on the raiden flip_pink_cup task. Verbatim clone of pi05_yam_pickbanana52 (same
-    # recipe, proven on banana); only name/repo_id/asset_id change. Dataset local/flippinkcup_yam is
-    # built by yam_dataset_builder/convert_yam_video_to_lerobot.py from the raiden processed export.
-    TrainConfig(
-        name="pi05_yam_flippinkcup",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
-        data=SimpleDataConfig(
-            repo_id="local/flippinkcup_yam",
-            assets=AssetsConfig(asset_id="pi05_yam_flippinkcup"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
-                outputs=[yam_policy.YAMOutputs()],
-            ),
-            base_config=DataConfig(
-                repack_transforms=_transforms.Group(
-                    inputs=[
-                        _transforms.RepackTransform(
-                            {
-                                "observation/image_head": "observation.images.scene_camera",
-                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
-                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
-                                "observation/state": "observation.state",
-                                "actions": "action",
-                                "prompt": "prompt",
-                            }
-                        )
-                    ]
-                ),
-                prompt_from_task=True,
-                action_sequence_keys=("action",),
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=5e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        num_train_steps=30_000,
-    ),
     # pi05 finetune on the UnloadPlates YAM LeRobot dataset (repo_id local/unload_plates_yam, 14-D
     # bimanual, 3 cameras). Ported from the dgx training checkout so serve-time transforms match
     # training. asset_id="pi05_yam_unload_plates" matches the norm_stats shipped in the checkpoint.
@@ -1282,6 +1447,412 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=30_000,
     ),
+    # pi05_yam_placeteabag_lora (2026-09-14, trained on dgx06 from the shared dsrl_openpi checkout): LoRA on PaliGemma +
+    # action expert, action_horizon 10, asset_id == training asset_id (norm_stats ship in the checkpoint assets/).
+    # pi05_yam_placeteabag (+ LoRA variant) — transplanted from the training checkout (dgx12 ~/rfm_rl/dsrl_openpi @ f08d5b5).
+    # Serving-side edits only: pi0_config.Pi0Config import name; no DataConfig(local_files_only=) (field gone here).
+    TrainConfig(
+        name="pi05_yam_placeteabag",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/placeteabag_yam",
+            assets=AssetsConfig(asset_id="pi05_yam_placeteabag"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=5e-5, decay_steps=30_000, decay_lr=5e-6),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_yam_placeteabag_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=SimpleDataConfig(
+            repo_id="local/placeteabag_yam_v2",
+            assets=AssetsConfig(asset_id="pi05_yam_placeteabag_lora"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=30_000, decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+    ),
+    # pi05_yam_multitask_all — the 9-task YAM finetune (dgx12, 60k steps, FSDP 4). Transplanted from the
+    # TRAINING checkout (~/rfm_rl/dsrl_openpi @ f08d5b5 on dgx12): same SimpleDataConfig + YAMInputs/Outputs,
+    # action_horizon=10, asset_id pi05_yam_multitask_all (norm_stats under assets/pi05_yam_multitask_all/).
+    # Serving-side edits only: pi0_config.Pi0Config import name; no DataConfig(local_files_only=) (field gone).
+    # pi05 FULL finetune on PlaceTeaBagInTeapot v2 (2026-09-16): same recipe as pi05_yam_placeteabag but on the
+    # untrimmed v2 dataset (local/placeteabag_yam_v2, 208 eps) the LoRA used; full FT (no LoRA/freeze), EMA 0.999,
+    # 30k steps, ckpt every 5k kept. Relaunch after the LoRA overtrained into a proprio copycat.
+    TrainConfig(
+        name="pi05_yam_placeteabag_full30k",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/placeteabag_yam_v2",
+            assets=AssetsConfig(asset_id="pi05_yam_placeteabag_full30k"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # pi05 FULL finetune on MakeCoffee (Keurig) 2026-09-17: clone of pi05_yam_placeteabag_full30k on the MakeCoffee
+    # LeRobot materialization (local/makecoffee_yam, 178 eps / 254067 frames); full FT (no LoRA/freeze), EMA 0.999,
+    # 30k steps, ckpt every 5k kept. Prompt from the dataset task string (prompt_from_task).
+    TrainConfig(
+        name="pi05_yam_makecoffee_full30k",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/makecoffee_yam",
+            assets=AssetsConfig(asset_id="pi05_yam_makecoffee_full30k"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # Delta-action recipe (trained 2026-09-18, fork 1453cd766fb4): same as pi05_yam_placeteabag_full30k but joints as deltas w.r.t. state.
+    TrainConfig(
+        name="pi05_yam_placeteabag_full30k_delta",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/placeteabag_yam_v2",
+            assets=AssetsConfig(asset_id="pi05_yam_placeteabag_full30k_delta"),
+            data_transforms=lambda model: _yam_data_transforms(model, use_delta_joint_actions=True),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # Delta-action recipe (trained 2026-09-18, fork 1453cd766fb4): same as pi05_yam_makecoffee_full30k but joints as deltas w.r.t. state.
+    TrainConfig(
+        name="pi05_yam_makecoffee_full30k_delta",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/makecoffee_yam",
+            assets=AssetsConfig(asset_id="pi05_yam_makecoffee_full30k_delta"),
+            data_transforms=lambda model: _yam_data_transforms(model, use_delta_joint_actions=True),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # pi05 FULL finetune on MakeCoffee (Keurig) v2 2026-09-17: SAME recipe+asset as pi05_yam_makecoffee_full30k (relaunch on dgx13 after dgx02 reboot killed iv8h3yef at 5300; new name keeps the old 5000 ckpt distinguishable). Clone of pi05_yam_placeteabag_full30k on the MakeCoffee
+    # LeRobot materialization (local/makecoffee_yam, 178 eps / 254067 frames); full FT (no LoRA/freeze), EMA 0.999,
+    # 30k steps, ckpt every 5k kept. Prompt from the dataset task string (prompt_from_task).
+    TrainConfig(
+        name="pi05_yam_makecoffee_full30k_v2",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/makecoffee_yam",
+            assets=AssetsConfig(asset_id="pi05_yam_makecoffee_full30k"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_yam_multitask_all",
+        project_name="rfm_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/yam_multitask_all",
+            assets=AssetsConfig(asset_id="pi05_yam_multitask_all"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=60_000,
+    ),
+    TrainConfig(
+        name="pi05_yam_flippinkcup",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="local/flippinkcup_yam",
+            assets=AssetsConfig(asset_id="pi05_yam_flippinkcup"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+    ),
+    # pi05 finetune on the UnloadPlates YAM LeRobot dataset (repo_id local/unload_plates_yam, 14-D
+    # bimanual, 3 cameras). Ported from the dgx training checkout so serve-time transforms match
+    # training. asset_id="pi05_yam_unload_plates" matches the norm_stats shipped in the checkpoint.
+    # action_horizon=15 as trained; the runner's ActionChunkBroker clamps to the model chunk at load.
+
     TrainConfig(
         name="pi05_yam_blockstack",
         # Finetune pi05 on the BlockOnBlock YAM dataset (repo_id local/blockstack_yam, 14-D bimanual,

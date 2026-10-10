@@ -1,7 +1,7 @@
 [project]
-name = "openpi"
+name = "yam_openpi"
 version = "0.1.0"
-description = "Physical Intelligence open source repo"
+description = "yam_openpi: TRI fork of Physical Intelligence openpi for the bimanual YAM arms (pi05 pretraining, fine-tuning, station serving)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -78,7 +78,8 @@ members = ["packages/*"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = ["docker", "third_party", "src/openpi/models_pytorch/transformers_replace/*"]
+# yam/ = ops scripts (pretrain/multihost/sagemaker tooling), not library code
+extend-exclude = ["docker", "third_party", "src/openpi/models_pytorch/transformers_replace/*", "yam/"]
 
 [tool.ruff.lint]
 # https://docs.astral.sh/ruff/rules/
@@ -140,3 +141,7 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 markers = ["manual: should be run manually."]
 testpaths = ["src", "scripts", "packages"]
+
+[tool.hatch.build.targets.wheel]
+# the distribution is yam_openpi but the import package stays `openpi` (too invasive to rename)
+packages = ["src/openpi"]

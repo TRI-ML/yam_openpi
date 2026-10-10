@@ -1,3 +1,13 @@
+# yam_openpi
+
+**yam_openpi** is TRI's fork of [openpi](https://github.com/Physical-Intelligence/openpi) for the bimanual **YAM** arms: pi05
+pretraining on the public YAM corpora (ABC-130k + MolmoAct2, see [docs/YAM_PRETRAIN.md](docs/YAM_PRETRAIN.md)), fine-tuning
+configs for our station tasks (`pi05_yam_*` in `src/openpi/training/config.py`), the `deploy_metadata.json` sidecar
+(`scripts/write_deploy_sidecar.py`) and the policy server the YAM Eval stations run (`scripts/serve_policy.py`). The Python
+package keeps the upstream name `openpi`. Everything below this section is the upstream README.
+
+---
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).

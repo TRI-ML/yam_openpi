@@ -22,20 +22,44 @@ def initialize_checkpoint_dir(
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
-    if checkpoint_dir.exists():
-        if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
-        elif resume:
-            resuming = True
-        else:
-            raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
-                "to indicate how to handle it."
-            )
+    # Multi-host: the checkpoint dir MUST be on a filesystem shared by all processes (orbax writes per-process shards
+    # into it). Only process 0 wipes/creates it; everyone else waits at a barrier, then reads the same directory.
+    if jax.process_index() == 0:
+        if checkpoint_dir.exists():
+            if overwrite:
+                checkpoint_dir.rmtree()
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+            elif resume:
+                resuming = True
+            else:
+                raise FileExistsError(
+                    f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+                    "to indicate how to handle it."
+                )
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if jax.process_count() > 1:
+        import time as _time
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        from jax.experimental import multihost_utils
+
+        multihost_utils.sync_global_devices("openpi_ckpt_dir_ready")
+        # NFS clients may cache the parent's negative lookup: force a lookup + poll until the dir is visible here.
+        for _ in range(120):
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            if checkpoint_dir.exists():
+                break
+            _time.sleep(1)
+        else:
+            raise RuntimeError(
+                f"{checkpoint_dir} not visible on process {jax.process_index()} after 120 s (shared FS?)"
+            )
+        resuming = bool(
+            resume
+            and not overwrite
+            and tuple(p.name for p in checkpoint_dir.iterdir() if p.name.isdigit()) not in [(), ("0",)]
+        )
+        multihost_utils.sync_global_devices("openpi_ckpt_dir_visible")
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
