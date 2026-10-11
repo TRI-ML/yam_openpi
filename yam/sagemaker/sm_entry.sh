@@ -127,7 +127,8 @@ if [ "${RESUME_FROM_S3:-1}" = "1" ]; then
   LATEST=$($S5 ls "$CKPT_S3_URI/*/.complete" 2>/dev/null | awk '{print $NF}' | sed -E 's|^(.*/)?([0-9]+)/\.complete$|\2|' | grep -E '^[0-9]+$' | sort -n | tail -1)
   if [ -n "$LATEST" ]; then
     log "found complete checkpoint step $LATEST at $CKPT_S3_URI; restoring"; t0=$(date +%s)
-    $S5 cp --exclude ".complete" "$CKPT_S3_URI/$LATEST/*" $CKD/$LATEST/ >/dev/null && $S5 cp "$CKPT_S3_URI/wandb_id.txt" $CKD/wandb_id.txt >/dev/null \
+    $S5 cp "$CKPT_S3_URI/wandb_id.txt" $CKD/wandb_id.txt >/dev/null 2>&1 || log "no wandb_id.txt on S3 (wandb was off, or first sync raced) -> a new wandb run will be started"
+    $S5 cp --exclude ".complete" "$CKPT_S3_URI/$LATEST/*" $CKD/$LATEST/ >/dev/null \
       && [ -f $CKD/$LATEST/_CHECKPOINT_METADATA ] && { touch $CKD/$LATEST/.synced; RESUME="--resume"; log "RESUMING from step $LATEST (restored in $(( $(date +%s)-t0 ))s)"; } \
       || { log "WARN restore of step $LATEST failed; starting fresh"; rm -rf $CKD/$LATEST $CKD/wandb_id.txt; }
   else log "no complete checkpoint at $CKPT_S3_URI; starting fresh"; fi
