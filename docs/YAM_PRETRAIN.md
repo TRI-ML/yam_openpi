@@ -125,3 +125,30 @@ Telemetry logged to wandb (`tri/openpi`): `dataset/*` composition once (from `YA
 |---|---|---|---|
 | `pi05_full_yam_abc_mm2_h32_dgx3node` (wandb tri/openpi `tr1xq2uf`) | dgx02+dgx03+dgx06, 24xA100 | 2.25 @ 384 | 66.7k steps, finishes 2026-10-11 |
 | `pi05_full_yam_abc_mm2_h32_sm_p5` | SageMaker 1x p5 (spot) | 1.06–1.18 @ 128 | 200k steps, finishes 2026-10-13 |
+
+
+## Mid-training on our station tasks (mt9)
+
+After the pretrain, a multi-task fine-tune on every raiden task with >= 100 success demos (2026-10: ToastBread,
+PlaceTeaBagInTeapot, SweepBeans, hammer_to_pegboard, CleanUpSpill, HangMugs, lennart_duplo_stack_3_2x2, MakeCoffee,
+SortUtensils). Same contract as the pretrain repo; NO camera rotation or gripper rescaling is needed (our bundles
+already store the right wrist in the pretrain orientation and grippers in 0..1 with 1 = open).
+
+```bash
+# 1. per-task sources (success only; needs <meta>/<Task>.uris + <Task>.status, see build_mt9.py docstring)
+AWS_PROFILE=claude-profile python yam/finetune/build_mt9.py --meta /tmp/mt9/meta --out /tmp/mt9/sources --workers 16 \
+    --tasks ToastBread PlaceTeaBagInTeapot SweepBeans hammer_to_pegboard CleanUpSpill HangMugs lennart_duplo_stack_3_2x2 MakeCoffee SortUtensils
+# 2. train + 5%/task val repos + lowdim memmaps
+SOURCES=/tmp/mt9/sources HF_LEROBOT_HOME=/tmp/mt9/lerobot_home bash yam/finetune/assemble_mt9.sh
+# 3. checks (one sample per task through the real pipeline, pretrain norm stats)
+HF_LEROBOT_HOME=... YAM_PRETRAIN_ASSETS_DIR=<ckpt>/assets MT9_SOURCES=/tmp/mt9/sources python yam/finetune/sample_checks_mt9.py
+# 4. zero-shot baseline of the pretrain checkpoint on the mt9 val repo (per task)
+HF_LEROBOT_HOME=... python yam/pretrain/eval_ckpt.py --config pi05_yam_abc_mm2_h32 --ckpt <pretrain step dir> --val-repo local/yam_mt9_val_v21 --group-by source --n-per-source 64 --no-wandb
+# 5. train (one 8-GPU node): full FT, batch 64, 20k steps, pretrain norm stats reused
+HF_LEROBOT_HOME=... YAM_PRETRAIN_PARAMS=<pretrain step dir>/params YAM_PRETRAIN_ASSETS_DIR=<pretrain step dir>/assets \
+LEROBOT_SKIP_TS_CHECK=1 [YAM_TASK_TEMPERATURE=0.5] \
+uv run scripts/train.py pi05_yam_mt9_h32_ft --exp-name <exp> --fsdp-devices 8
+```
+
+`YAM_TASK_TEMPERATURE` (data_loader.make_task_temperature_sampler) tempers the per-task mix: share ∝ frames^T
+(1 = frame-proportional, 0.5 = sqrt). The `_smoke` twin (LoRA, batch 8, 200 steps) runs on one 48 GB GPU.

@@ -1013,6 +1013,149 @@ _CONFIGS = [
         keep_period=5_000,
         log_interval=50,
     ),
+    # YAM multi-task mid-training on our 9 station tasks (>=100 success demos each, 2026-10) from the YAM pretrain
+    # (pi05_yam_abc_mm2_h32). Same contract as the pretrain repo: 14-D absolute joints, grippers 0..1 (1 = open), cameras
+    # top (= ego) / left_wrist / right_wrist, horizon 32, pretrain norm stats reused via AssetsConfig. Repo built by
+    # yam/finetune/build_mt9.py + yam/pretrain/assemble_v21.py. Env: YAM_FT_REPO_ID, YAM_PRETRAIN_PARAMS, YAM_PRETRAIN_ASSETS_DIR,
+    # optional YAM_TASK_TEMPERATURE (sqrt = 0.5) for a tempered per-task mix (see data_loader.make_task_temperature_sampler).
+    TrainConfig(
+        name="pi05_yam_mt9_h32_ft",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=SimpleDataConfig(
+            repo_id=os.environ.get("YAM_FT_REPO_ID", "local/yam_mt9_v21"),
+            assets=AssetsConfig(assets_dir=os.environ.get("YAM_PRETRAIN_ASSETS_DIR"), asset_id="local/abc_mm2_train_v21"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(os.environ.get("YAM_PRETRAIN_PARAMS", "gs://openpi-assets/checkpoints/pi05_base/params")),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        batch_size=64,
+        num_workers=16,
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1000, peak_lr=2.5e-5, decay_steps=20000, decay_lr=2.5e-6),
+        num_train_steps=20000,
+        save_interval=2000,
+        keep_period=10000,
+        log_interval=50,
+        wandb_enabled=True,
+    ),
+    # mt10 = mt9 + BuildSprinkler (ingested 2026-10-10), ALL data (no val holdout) -> repo local/yam_mt10_v21 (S3 cache
+    # tri-yam/pretrain_data/yam_mt10_v21). Launched on SageMaker via yam/sagemaker/sm_entry.sh MODE=finetune.
+    TrainConfig(
+        name="pi05_yam_mt10_h32_ft",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=SimpleDataConfig(
+            repo_id=os.environ.get("YAM_FT_REPO_ID", "local/yam_mt10_v21"),
+            assets=AssetsConfig(assets_dir=os.environ.get("YAM_PRETRAIN_ASSETS_DIR"), asset_id="local/abc_mm2_train_v21"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(os.environ.get("YAM_PRETRAIN_PARAMS", "gs://openpi-assets/checkpoints/pi05_base/params")),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        batch_size=64,
+        num_workers=64,
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1000, peak_lr=2.5e-5, decay_steps=20000, decay_lr=2.5e-6),
+        num_train_steps=20000,
+        save_interval=2000,
+        keep_period=10000,
+        log_interval=50,
+        wandb_enabled=True,
+    ),
+    # YAM multi-task mid-training on our 9 station tasks (>=100 success demos each, 2026-10) from the YAM pretrain
+    # (pi05_yam_abc_mm2_h32). Same contract as the pretrain repo: 14-D absolute joints, grippers 0..1 (1 = open), cameras
+    # top (= ego) / left_wrist / right_wrist, horizon 32, pretrain norm stats reused via AssetsConfig. Repo built by
+    # yam/finetune/build_mt9.py + yam/pretrain/assemble_v21.py. Env: YAM_FT_REPO_ID, YAM_PRETRAIN_PARAMS, YAM_PRETRAIN_ASSETS_DIR,
+    # optional YAM_TASK_TEMPERATURE (sqrt = 0.5) for a tempered per-task mix (see data_loader.make_task_temperature_sampler).
+    TrainConfig(
+        name="pi05_yam_mt9_h32_ft_smoke",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=SimpleDataConfig(
+            repo_id=os.environ.get("YAM_FT_REPO_ID", "local/yam_mt9_v21"),
+            assets=AssetsConfig(assets_dir=os.environ.get("YAM_PRETRAIN_ASSETS_DIR"), asset_id="local/abc_mm2_train_v21"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(os.environ.get("YAM_PRETRAIN_PARAMS", "gs://openpi-assets/checkpoints/pi05_base/params")),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        batch_size=8,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=10, peak_lr=2.5e-5, decay_steps=200, decay_lr=2.5e-6),
+        num_train_steps=200,
+        save_interval=10,
+        keep_period=10,
+        log_interval=5,
+        wandb_enabled=False,
+    ),
     #
     # Fine-tuning Aloha configs.
     #

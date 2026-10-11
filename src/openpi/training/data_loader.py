@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
@@ -195,6 +196,30 @@ def make_lerobot_dataset(
         lerobot_dataset.check_timestamps_sync = orig
 
 
+def make_task_temperature_sampler(repo_id: str, temperature: float, num_samples: int, seed: int = 0):
+    """Tempered per-task mixture for a LeRobot v2.1 repo: task sampling share ∝ frames_task ** temperature
+    (1.0 = frame-proportional, 0.5 = sqrt, 0.0 = uniform over tasks). Returns a WeightedRandomSampler over
+    frame indices (with replacement) and logs the resulting mix. Single-process only (multi-host keeps its
+    DistributedSampler). Enabled by env YAM_TASK_TEMPERATURE on the YAM fine-tune configs."""
+    root = pathlib.Path(os.environ.get("HF_LEROBOT_HOME", pathlib.Path.home() / ".cache/huggingface/lerobot")) / repo_id
+    with open(root / "meta/episodes.jsonl") as f:
+        eps = [json.loads(line) for line in f]
+    frames_per_task: dict[str, int] = {}
+    for e in eps:
+        frames_per_task[e["tasks"][0]] = frames_per_task.get(e["tasks"][0], 0) + e["length"]
+    share = {t: n**temperature for t, n in frames_per_task.items()}
+    z = sum(share.values())
+    share = {t: v / z for t, v in share.items()}
+    per_frame_w = {t: share[t] / frames_per_task[t] for t in share}
+    weights = np.concatenate([np.full(e["length"], per_frame_w[e["tasks"][0]], np.float64) for e in eps])
+    total = sum(frames_per_task.values())
+    logging.info("task temperature %.2f mix (task: frame share -> sample share): %s", temperature,
+                 {t[:40]: (round(frames_per_task[t] / total, 3), round(share[t], 3)) for t in frames_per_task})
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(torch.as_tensor(weights), num_samples=num_samples, replacement=True, generator=g)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -386,6 +411,11 @@ def create_torch_data_loader(
             seed=seed,
             drop_last=True,
         )
+    temp = os.environ.get("YAM_TASK_TEMPERATURE")
+    if temp and sampler is None and framework == "jax" and data_config.repo_id not in (None, "fake"):
+        sampler = make_task_temperature_sampler(data_config.repo_id, float(temp), num_samples=len(dataset), seed=seed)
+    elif temp and sampler is not None:
+        logging.warning("YAM_TASK_TEMPERATURE ignored: a distributed sampler is in use")
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
