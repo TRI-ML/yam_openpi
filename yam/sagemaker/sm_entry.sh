@@ -49,6 +49,24 @@ stage_convert(){ # $1 = s3 repo uri, $2 = local repo dir, $3 = stage out dir
   [ "${KEEP_RAW:-0}" = "1" ] || rm -rf $2
 }
 t_stage0=$(date +%s)
+# 1b. MODE=finetune: data = a prebuilt v2.1 repo cache (DATA_TRAIN_URI, must have <root>/_COMPLETE); init = a pretrain checkpoint
+#     (INIT_URI = .../<step>/ with params/ + assets/). No staging, no norm stats (the PRETRAIN stats travel with the init assets), no val.
+if [ "$MODE" = "finetune" ]; then
+  DATA_TRAIN_URI=${DATA_TRAIN_URI:?s3 prefix of the v2.1 train repo}; INIT_URI=${INIT_URI:?s3 prefix of the pretrain step (params/, assets/)}
+  if [ ! -f $TRAIN/meta/info.json ]; then
+    [ -n "${DATA_COMPLETE_URI:-}" ] && { $S5 ls "$DATA_COMPLETE_URI" >/dev/null 2>&1 || { log "FATAL data cache incomplete: $DATA_COMPLETE_URI missing"; exit 6; }; }
+    log "fetching finetune repo $DATA_TRAIN_URI -> $TRAIN"; t0=$(date +%s); $S5 cp "$DATA_TRAIN_URI/*" $TRAIN/ >/dev/null || { log "FATAL repo fetch failed"; exit 6; }; log "repo fetched in $(( $(date +%s)-t0 ))s"
+  fi
+  [ -f $TRAIN/lowdim_mm/action.npy ] || { log "building lowdim memmaps"; $PY $S/build_lowdim_memmap.py $TRAIN --workers 32 >> $W/logs/memmap.log 2>&1 || { log "FATAL memmap failed"; exit 5; }; }
+  INIT_STEP=$(basename "${INIT_URI%/}"); INIT=$W/init/$INIT_STEP; mkdir -p $INIT
+  if [ ! -f $INIT/params/_METADATA ]; then log "fetching init checkpoint $INIT_URI -> $INIT"; t0=$(date +%s); $S5 cp --exclude "*train_state/*" --exclude "deploy_metadata.json" --exclude ".complete" "$INIT_URI/*" $INIT/ >/dev/null || { log "FATAL init fetch failed"; exit 7; }; log "init fetched in $(( $(date +%s)-t0 ))s"; fi
+  ls $INIT/params | head -3; ls $INIT/assets/*/ 2>/dev/null | head -3
+  export YAM_PRETRAIN_PARAMS=$INIT/params YAM_PRETRAIN_ASSETS_DIR=$INIT/assets YAM_FT_REPO_ID=local/$TRAIN_REPO
+  [ -n "${YAM_TASK_TEMPERATURE:-}" ] && export YAM_TASK_TEMPERATURE && log "task temperature $YAM_TASK_TEMPERATURE"
+  jq -c '{total_episodes,total_frames,total_tasks,fps}' $TRAIN/meta/info.json; cp $TRAIN/meta/info.json $TRAIN/meta/tasks.jsonl $W/logs/ 2>/dev/null
+  echo "init=$INIT_URI data=$DATA_TRAIN_URI temperature=${YAM_TASK_TEMPERATURE:-1.0}" > $W/logs/finetune_provenance.txt
+  EVAL_WATCH=${EVAL_WATCH:-0}; VAL=/nonexistent
+else
 # 2. data: cache first
 if [ "$MODE" = "full" ] && $S5 ls "$DATA_CACHE_URI/_COMPLETE" >/dev/null 2>&1 && [ ! -f $TRAIN/meta/info.json ]; then
   log "data cache hit: $DATA_CACHE_URI -> $HF_LEROBOT_HOME/local"; $S5 cp "$DATA_CACHE_URI/train/*" $TRAIN/ >/dev/null && $S5 cp "$DATA_CACHE_URI/val/*" $VAL/ >/dev/null || { log "cache fetch failed, falling back to build"; rm -rf $TRAIN $VAL; }
@@ -99,6 +117,7 @@ fi
 jq -c '{total_episodes,total_frames,total_tasks,fps}' $TRAIN/meta/info.json; [ -f $VAL/meta/info.json ] && jq -c '{val_episodes:.total_episodes,val_frames:.total_frames}' $VAL/meta/info.json
 export YAM_ASSEMBLY_JSON=$TRAIN/meta/assembly.json
 cp $TRAIN/meta/assembly.json $TRAIN/meta/info.json $ASSET/norm_stats.json $W/logs/ 2>/dev/null
+fi   # end MODE != finetune
 $S5 cp $W/logs/ "$OUT_URI/$EXP/logs_prep/" >/dev/null 2>&1 || true
 
 # 6. resume? pull the latest COMPLETE step (has `.complete`, written last by ckpt_sync.sh) from $CKPT_S3_URI into scratch
@@ -133,7 +152,7 @@ fi
 # 8. train
 ls -la $TRAIN/lowdim_mm/ 2>/dev/null | tail -2
 log "starting training: $CFG exp=$EXP fsdp=$FSDP_DEVICES $RESUME ${TRAIN_OVERRIDES:-}"
-export WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,abc130k_v3ar,molmoact2_v3ar,lerobot_v3,joint14_abs,horizon32,sagemaker,h100}
+export WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,abc130k_v3ar,molmoact2_v3ar,lerobot_v3,joint14_abs,horizon32,sagemaker,h100}; [ -n "${YAM_PRETRAIN_PARAMS:-}" ] && log "init params: $YAM_PRETRAIN_PARAMS"
 [ -z "$RESUME" ] && OVERWRITE="--overwrite" || OVERWRITE=""
 $PY scripts/train.py $CFG --exp-name $EXP --checkpoint-base-dir $CK --fsdp-devices $FSDP_DEVICES --num-workers $NUM_WORKERS $RESUME $OVERWRITE ${TRAIN_OVERRIDES:-} 2>&1 | tee -a $W/logs/train.log
 rc=${PIPESTATUS[0]}; log "train exited rc=$rc"
