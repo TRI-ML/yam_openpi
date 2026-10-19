@@ -27,13 +27,14 @@ pass(){
   [ -d "$SRC" ] || return 0
   [ -f "$SRC/wandb_id.txt" ] && ! exists "$DST/wandb_id.txt" && put_file "$SRC/wandb_id.txt" "$DST/wandb_id.txt" && log "synced wandb_id.txt"
   for d in $(ls -d "$SRC"/[0-9]* 2>/dev/null | sort -V); do
-    [ -f "$d/.synced" ] && continue; finished "$d" || continue
-    local st; st=$(basename "$d"); log "syncing step $st -> $DST/$st/"; local t0=$(date +%s)
+    local st; st=$(basename "$d"); [ -f "$SRC/.synced/$st" ] && continue; finished "$d" || continue
+    log "syncing step $st -> $DST/$st/"; local t0=$(date +%s)
     if copy_dir "$d" "$DST/$st"; then
-      # the sentinel is written LAST: readers treat a step as complete only when it exists
-      echo "$(date -u +%FT%TZ) $(du -sb "$d" | cut -f1)" > "$d/.synced" && put_file "$d/.synced" "$DST/$st/.complete"
+      # the sentinel is written LAST and lives OUTSIDE the orbax step dir ($SRC/.synced/<step>): writing it inside the
+      # step dir raced orbax's pruning of the previous step (OSError: Directory not empty) at the end of training.
+      mkdir -p "$SRC/.synced" && echo "$(date -u +%FT%TZ) $(du -sb "$d" | cut -f1)" > "$SRC/.synced/$st" && put_file "$SRC/.synced/$st" "$DST/$st/.complete"
       log "step $st synced in $(( $(date +%s)-t0 ))s"
-    else log "WARN sync of step $st failed (retry next pass)"; rm -f "$d/.synced"; fi
+    else log "WARN sync of step $st failed (retry next pass)"; rm -f "$SRC/.synced/$st"; fi
   done
 }
 if [ $ONCE = 1 ]; then pass; exit 0; fi

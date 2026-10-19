@@ -51,7 +51,7 @@ def main():
         assert not list(dst.rglob("*.sagemaker-uploaded")), "markers leaked into the mirror"
         assert not list(dst.rglob("*orbax-checkpoint-tmp*")), "in-progress tmp dir leaked"
         assert (dst / "40" / ".complete").exists() and (dst / "20" / ".complete").exists()
-        assert (src / "40" / ".synced").exists() and not (src / "80" / ".synced").exists()
+        assert (src / ".synced" / "40").exists() and not (src / ".synced" / "80").exists()
         # re-running must be a no-op (idempotent)
         r2 = subprocess.run(["bash", str(SYNC), str(src), str(dst), "--once"], capture_output=True, text=True)
         assert "syncing step" not in r2.stdout, r2.stdout

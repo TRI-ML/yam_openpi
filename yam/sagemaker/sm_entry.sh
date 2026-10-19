@@ -129,7 +129,7 @@ if [ "${RESUME_FROM_S3:-1}" = "1" ]; then
     log "found complete checkpoint step $LATEST at $CKPT_S3_URI; restoring"; t0=$(date +%s)
     $S5 cp "$CKPT_S3_URI/wandb_id.txt" $CKD/wandb_id.txt >/dev/null 2>&1 || log "no wandb_id.txt on S3 (wandb was off, or first sync raced) -> a new wandb run will be started"
     $S5 cp --exclude ".complete" "$CKPT_S3_URI/$LATEST/*" $CKD/$LATEST/ >/dev/null \
-      && [ -f $CKD/$LATEST/_CHECKPOINT_METADATA ] && { touch $CKD/$LATEST/.synced; RESUME="--resume"; log "RESUMING from step $LATEST (restored in $(( $(date +%s)-t0 ))s)"; } \
+      && [ -f $CKD/$LATEST/_CHECKPOINT_METADATA ] && { mkdir -p $CKD/.synced && touch $CKD/.synced/$LATEST; RESUME="--resume"; log "RESUMING from step $LATEST (restored in $(( $(date +%s)-t0 ))s)"; } \
       || { log "WARN restore of step $LATEST failed; starting fresh"; rm -rf $CKD/$LATEST $CKD/wandb_id.txt; }
   else log "no complete checkpoint at $CKPT_S3_URI; starting fresh"; fi
 fi
@@ -162,6 +162,6 @@ touch $W/STOP_EVAL; [ -n "$EVAL_PID" ] && { log "waiting for the eval watcher's 
 touch $CKD/.stop_sync; [ -n "${SYNC_PID:-}" ] && { log "waiting for the checkpoint syncer's final pass"; timeout ${SYNC_FINAL_TIMEOUT:-3600} tail --pid=$SYNC_PID -f /dev/null; }
 tail -3 $W/logs/ckpt_sync.log 2>/dev/null
 LAST=$(ls -d $CKD/[0-9]* 2>/dev/null | sort -V | tail -1)
-if [ -n "$LAST" ] && [ -f $LAST/.synced ]; then log "publishing $LAST -> $OUT_URI/$EXP/final/"; $S5 cp --exclude ".synced" $LAST/ "$OUT_URI/$EXP/final/$(basename $LAST)/" >/dev/null || log "WARN final copy failed"; fi
+if [ -n "$LAST" ] && [ -f $CKD/.synced/$(basename $LAST) ]; then log "publishing $LAST -> $OUT_URI/$EXP/final/"; $S5 cp $LAST/ "$OUT_URI/$EXP/final/$(basename $LAST)/" >/dev/null || log "WARN final copy failed"; fi
 $S5 cp $W/logs/ "$OUT_URI/$EXP/logs/" >/dev/null 2>&1 || true
 kill $(jobs -p) 2>/dev/null; exit $rc
