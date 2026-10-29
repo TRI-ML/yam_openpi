@@ -58,7 +58,7 @@ python yam/pretrain/assemble_v21.py $HF_LEROBOT_HOME/local/yam_s2_train_v21 --wo
   --repo abcmolmo=$IN/abc_molmo_train \
   --repo oopsie_SE3Labs=$IN/oopsie/SE3Labs --repo oopsie_Enact=$IN/oopsie/Enact --repo oopsie_AI2_MOLMOACT2=$IN/oopsie/AI2_MOLMOACT2 \
   $(for d in $IN/oopsie/CMU_Aire/chunk_*; do echo --repo oopsie_CMU_Aire=$d; done) \
-  --repo absim=$IN/abc_sim --sample abcmolmo=0.10:0
+  --repo absim=$IN/abc_sim --sample abcmolmo=0.10:0 --absim-keep failure
 python yam/pretrain/build_lowdim_memmap.py $HF_LEROBOT_HOME/local/yam_s2_train_v21
 ```
 
@@ -112,3 +112,10 @@ uv run scripts/train.py pi05_yam_s2_meta --exp-name s2_smoke --fsdp-devices 8 --
 ```
 
 Expect `source mix (pool -> sample share)` in the log, `loss/{abc,oopsie,absim}` and `prefix/dropped_frac` ≈ 0.3 in wandb.
+
+
+## ABC-sim: failures only (2026-10-29)
+ABC-sim outcomes are `success_suboptimal` / `failure`; a policy rollout that merely completed the task is not teleop-grade, so it must not
+train `<quality=success>`. The assembler keeps only the 13,948 failures by default (`--absim-keep failure`; `--absim-keep all` restores the old
+behaviour). Consequence: `<quality=success> <domain=sim>` has no training data until ABC's ~400 h sim teleop is added; sim eval prompts it anyway
+(compositional). Mix is 0.40 / 0.35 / 0.25 (abc+molmo / oopsie / absim).

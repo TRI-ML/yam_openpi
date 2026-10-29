@@ -1020,7 +1020,7 @@ _CONFIGS = [
                     prompt_from_task=True,
                     meta_prefix_dropout=meta_prefix_dropout,
                     state_dropout=0.1,
-                    source_mix={"abc+molmo": 0.35, "oopsie_*": 0.35, "absim": 0.30},
+                    source_mix={"abc+molmo": 0.40, "oopsie_*": 0.35, "absim": 0.25},  # absim = failures only (2026-10-29)
                     action_sequence_keys=("action",),
                 ),
             ),

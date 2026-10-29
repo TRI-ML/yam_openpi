@@ -137,6 +137,8 @@ def repo_episodes(label, d, a):
         L = {r["episode_index"]: r for r in map(json.loads, open(d / "meta/episode_labels.jsonl"))}  # GLOBAL index; never the root labels.jsonl
         n0 = len(eps); eps = [e for e in eps if not L[e["episode_index"]].get("trivial_success")]; note = f"dropped {n0 - len(eps)} trivial_success episodes"
         Q = {"success_suboptimal": 1, "failure": 0}
+        if a.absim_keep == "failure":  # policy "successes" are success_suboptimal: not teleop-grade, so they must not teach <quality=success>
+            n1 = len(eps); eps = [e for e in eps if L[e["episode_index"]]["outcome"] == "failure"]; note += f"; kept failures only ({len(eps)} of {n1})"
         lab = lambda e: ("absim", Q[L[e["episode_index"]]["outcome"]], 1)
     else:
         raise SystemExit(f"unknown --repo label {label!r} (abcmolmo | oopsie_<lab> | absim)")
@@ -179,7 +181,7 @@ def main_repos(a):
              "domain": {"dtype": "int64", "shape": [1], "names": None}}
     write_meta(root, a.robot_type, episodes, tasks, frame0, extra, codec="mixed (av1 / h264)",
                assembly={"sources": per_source, "dropped": {**dropped, **{f"oopsie_{k}": f"excluded: {v}" for k, v in EXCLUDED_OOPSIE.items()}},
-                         "inputs": a.repo, "columns": {"quality": "1 success / 0 failure", "domain": "0 real / 1 sim"}})
+                         "inputs": a.repo, "columns": {"quality": "1 success / 0 failure", "domain": "0 real / 1 sim"}, "absim_keep": a.absim_keep})
 
 
 def write_meta(root, robot_type, episodes, tasks, frame0, extra_feats, codec, assembly):
@@ -213,6 +215,8 @@ def main():
     ap.add_argument("--cache-sources", nargs="*", default=None, help="stage-2: keep only these abc_molmo_v21 cache sources (its assembly.json keys)")
     ap.add_argument("--sample", nargs="*", default=[], help="stage-2: LABEL=FRAC[:SEED] keeps a uniform random FRAC of that input's episodes (seed default 0)")
     ap.add_argument("--limit", nargs="*", default=[], help="stage-2: LABEL=N keeps the first N episodes of each input with that label"); ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--absim-keep", choices=["failure", "all"], default="failure",
+                    help="stage-2: ABC-sim rollouts to keep; default keeps only failures (success_suboptimal is not teleop-grade success)")
     ap.add_argument("--robot-type", default="yam_bimanual")
     ap.add_argument("--skip", nargs="*", default=[], help="source dir names to skip (e.g. camera-less tasks)")
     ap.add_argument("--exclude", nargs="*", default=[], help="<source_name>:<file of source episode ids to drop> (val holdout)")
