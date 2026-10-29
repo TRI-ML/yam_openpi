@@ -26,6 +26,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.transforms as _transforms
 
 
 def maybe_init_distributed():
@@ -80,12 +81,13 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, entity=config.wandb_entity)
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            entity=config.wandb_entity,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -161,7 +163,7 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions] | tuple[_model.Observation, _model.Actions, dict],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
@@ -170,15 +172,17 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        per_sample = jnp.mean(model.compute_loss(rng, observation, actions, train=True), axis=-1)
+        return jnp.mean(per_sample), per_sample
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    observation, actions, *extras = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, per_sample), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -210,7 +214,16 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "lr": config.lr_schedule.create()(state.step),
     }
+    extras = extras[0] if extras else {}
+    if "source_group" in extras:  # per-source loss as sum/count, reduced over the log interval in main()
+        for i, name in enumerate(_transforms.SOURCE_GROUPS):
+            m = (extras["source_group"] == i).astype(jnp.float32)
+            info[f"loss_sum/{name}"] = jnp.sum(per_sample * m)
+            info[f"loss_cnt/{name}"] = jnp.sum(m)
+    if "prefix_dropped" in extras:
+        info["prefix/dropped_frac"] = jnp.mean(extras["prefix_dropped"].astype(jnp.float32))
     return new_state, info
 
 
@@ -236,6 +249,7 @@ def main(config: _config.TrainConfig):
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
+        max_to_keep=config.max_to_keep,
         overwrite=config.overwrite,
         resume=config.resume,
     )
@@ -302,6 +316,7 @@ def main(config: _config.TrainConfig):
         with open(_asm) as _f:
             _a = _json.load(_f)
         _src = _a.get("sources", {})
+        _stage2 = all("end_frame" in v for v in _src.values())  # assemble_v21.py --repo: one entry per source label
         _comp = {
             "dataset/total_episodes": _a.get("total_episodes"),
             "dataset/total_frames": _a.get("total_frames"),
@@ -312,6 +327,10 @@ def main(config: _config.TrainConfig):
             "dataset/abc_episodes": sum(v["episodes"] for k, v in _src.items() if k != "molmo_yam_v3"),
             "dataset/abc_frames": sum(v["frames"] for k, v in _src.items() if k != "molmo_yam_v3"),
         }
+        if _stage2:
+            _comp = {k: v for k, v in _comp.items() if not k.startswith(("dataset/molmo_", "dataset/abc_"))}
+            for _k, _v in _src.items():
+                _comp.update({f"dataset/{_k}/{f}": _v[f] for f in ("episodes", "frames", "success_episodes", "failure_episodes")})
         wandb.run.summary.update(_comp)
         wandb.log(_comp, step=start_step)
         wandb.config.update(
@@ -334,6 +353,11 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            for name in _transforms.SOURCE_GROUPS:
+                if f"loss_sum/{name}" in reduced_info:
+                    s, c = reduced_info.pop(f"loss_sum/{name}"), reduced_info.pop(f"loss_cnt/{name}")
+                    if c > 0:
+                        reduced_info[f"loss/{name}"] = s / c
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             if is_main_process():
                 pbar.write(f"Step {step}: {info_str}")

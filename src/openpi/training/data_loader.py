@@ -1,4 +1,6 @@
 from collections.abc import Iterator, Sequence
+import fnmatch
+import json
 import logging
 import multiprocessing
 import os
@@ -52,12 +54,21 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(
+        self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn], keep_keys: Sequence[str] = ()
+    ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        # Keys copied from the input sample to the output untouched (the repack transform drops everything else).
+        self._keep_keys = tuple(keep_keys)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        item = self._dataset[index]
+        out = self._transform(item)
+        for k in self._keep_keys:
+            if k in item:
+                out[k] = item[k]
+        return out
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -172,6 +183,82 @@ class YamLeRobotDataset(lerobot_dataset.LeRobotDataset):
         return super()._query_hf_dataset(query_indices)
 
 
+# Per-sample keys carried next to (Observation, actions) for telemetry: DataLoaderImpl yields them as a third element.
+BATCH_EXTRA_KEYS = ("source_group", "prefix_dropped")
+
+
+class SourceMixSampler(torch.utils.data.Sampler):
+    """Samples frame indices of a stage-2 repo by SOURCE weight instead of frame count (with replacement).
+
+    `mix` keys match the `source` labels of <repo>/meta/assembly.json (each source one contiguous frame range):
+    "abc+molmo" = one pool, frames drawn uniformly over the union (frame-proportional inside); a glob such as
+    "oopsie_*" = its weight split equally over the matching sources (balances labs). Every source must be matched by
+    exactly one key; keys matching nothing present are dropped with a warning and the rest renormalised (smoke repos).
+    One epoch = `num_samples` draws; `set_epoch` reseeds so epochs differ."""
+
+    def __init__(self, sources: dict, mix: dict[str, float], num_samples: int, seed: int = 0):
+        ranges, weights, owner, names = [], [], {}, []
+        for key, w in mix.items():
+            if "+" in key:
+                groups = [[s for s in key.split("+") if s in sources]]
+            else:
+                groups = [[s] for s in sources if fnmatch.fnmatchcase(s, key)]
+            groups = [g for g in groups if g]
+            if not groups:
+                logging.warning(f"source mix key {key!r} matches no source in the repo; dropped")
+                continue
+            for g in groups:
+                for s in g:
+                    if s in owner:
+                        raise ValueError(f"source {s!r} matched by both {owner[s]!r} and {key!r}")
+                    owner[s] = key
+                ranges.append([(sources[s]["first_frame"], sources[s]["end_frame"]) for s in g])
+                names.append("+".join(g))
+                weights.append(w / len(groups))
+        if missing := set(sources) - set(owner):
+            raise ValueError(f"sources {sorted(missing)} are not covered by the source mix {mix}")
+        self._ranges = ranges
+        self._p = np.asarray(weights, np.float64) / np.sum(weights)
+        self._num_samples = num_samples
+        self._seed = seed
+        self._epoch = 0
+        logging.info(
+            "source mix (pool -> sample share): %s",
+            {n: round(float(p), 4) for n, p in zip(names, self._p, strict=True)},
+        )
+
+    @classmethod
+    def from_repo(cls, repo_id: str, mix: dict[str, float], num_samples: int, seed: int = 0) -> "SourceMixSampler":
+        root = pathlib.Path(lerobot_dataset.HF_LEROBOT_HOME) / repo_id
+        with open(root / "meta/assembly.json") as f:
+            sources = json.load(f)["sources"]
+        logging.info(f"source mix over {root}: { {k: v['frames'] for k, v in sources.items()} } frames")
+        return cls(sources, mix, num_samples, seed)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __iter__(self):
+        rng = np.random.default_rng([self._seed, self._epoch])
+        left = self._num_samples
+        while left > 0:
+            n = min(left, 1 << 20)
+            pool = rng.choice(len(self._ranges), size=n, p=self._p)
+            out = np.empty(n, np.int64)
+            for i, rr in enumerate(self._ranges):
+                sel = np.flatnonzero(pool == i)
+                lens = np.asarray([b - a for a, b in rr], np.int64)
+                u = rng.integers(0, lens.sum(), size=len(sel))  # uniform over the pool's frames
+                cum = np.cumsum(lens) - lens
+                j = np.searchsorted(cum, u, side="right") - 1
+                out[sel] = np.asarray([a for a, _ in rr], np.int64)[j] + (u - cum[j])
+            yield from out.tolist()
+            left -= n
+
+
 def make_lerobot_dataset(
     repo_id: str, *, delta_timestamps: dict | None = None, **kwargs
 ) -> lerobot_dataset.LeRobotDataset:
@@ -214,7 +301,13 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        if data_config.meta_prefix_dropout is not None:
+            prompt = _transforms.QualityDomainPrefixPrompt(dataset_meta.tasks, dropout_p=data_config.meta_prefix_dropout)
+        else:
+            prompt = _transforms.PromptFromLeRobotTask(dataset_meta.tasks)
+        dataset = TransformedDataset(dataset, [prompt])
+    if "source" in dataset_meta.features:
+        dataset = TransformedDataset(dataset, [_transforms.SourceGroupFromColumn()])
 
     return dataset
 
@@ -254,8 +347,10 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *([_transforms.StateDropout(data_config.state_dropout)] if data_config.state_dropout > 0 else []),
             *data_config.model_transforms.inputs,
         ],
+        keep_keys=BATCH_EXTRA_KEYS,
     )
 
 
@@ -385,6 +480,11 @@ def create_torch_data_loader(
             shuffle=shuffle,
             seed=seed,
             drop_last=True,
+        )
+    if data_config.source_mix and framework == "jax":
+        # Replaces the multi-host DistributedSampler too: each process draws its own i.i.d. stream (seed + process id).
+        sampler = SourceMixSampler.from_repo(
+            data_config.repo_id, data_config.source_mix, num_samples=len(dataset), seed=seed + jax.process_index()
         )
     if framework == "pytorch":
         if torch.distributed.is_initialized():
@@ -621,4 +721,8 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            extras = {k: batch.pop(k) for k in BATCH_EXTRA_KEYS if k in batch}
+            if extras:
+                yield _model.Observation.from_dict(batch), batch["actions"], extras
+            else:
+                yield _model.Observation.from_dict(batch), batch["actions"]
