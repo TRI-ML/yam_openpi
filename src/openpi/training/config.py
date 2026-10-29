@@ -989,6 +989,15 @@ _CONFIGS = [
             model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
             data=SimpleDataConfig(
                 repo_id="local/yam_s2_train_v21",
+                # Norm stats the 66699 init was trained with (not recomputed on the mix); YAM_S2_ASSETS_DIR or
+                # --data.assets.assets-dir for a local copy (s3:// is synced with the aws cli).
+                assets=AssetsConfig(
+                    assets_dir=os.environ.get(
+                        "YAM_S2_ASSETS_DIR",
+                        "s3://tri-ml-datasets-uw2/tri-yam/train_runs/pi05_yam_abc_mm2_h32/pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66699/assets",
+                    ),
+                    asset_id="local/abc_mm2_train_v21",
+                ),
                 data_transforms=lambda model: _transforms.Group(
                     inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
                     outputs=[yam_policy.YAMOutputs()],

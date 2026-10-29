@@ -11,7 +11,9 @@ failure and sim / real data. The two configs are identical except for the prompt
 Shared (differences from `pi05_yam_abc_mm2_h32`): init = params of
 `s3://tri-ml-datasets-uw2/tri-yam/train_runs/pi05_yam_abc_mm2_h32/pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66699/params`
 (params only, fresh optimizer; override with `YAM_S2_INIT_PARAMS=<dir>` or `--weight-loader.params-path <dir>`; an `s3://`
-default is synced with the aws cli into `$OPENPI_DATA_HOME`), repo `local/yam_s2_train_v21`, lr 1e-5 cosine → 1e-6, 500 warmup,
+default is synced with the aws cli into `$OPENPI_DATA_HOME`), norm stats = the ones 66699 was trained with
+(`.../checkpoints/66699/assets`, asset id `local/abc_mm2_train_v21`; override with `YAM_S2_ASSETS_DIR=<dir>` or
+`--data.assets.assets-dir <dir>`), repo `local/yam_s2_train_v21`, lr 1e-5 cosine → 1e-6, 500 warmup,
 60k steps, AdamW weight decay 1e-4, checkpoints every 10k (keep every 20k + the last 2), state dropout 0.1 (normalized state
 zeroed per sample, after `Normalize`), per-sample source mix, wandb entity `tri`. Unchanged: pi05, horizon 32, action dim 32
 (14 used), absolute actions, 3 cameras 224², bf16, FSDP 8, EMA 0.99, batch 128. There is no in-training val hook (offline
@@ -21,7 +23,7 @@ zeroed per sample, after `Normalize`), per-sample source mix, wandb entity `tri`
 
 | source label | input (LeRobot v2.1) | quality | domain |
 |---|---|---|---|
-| `abc`, `molmo` | `s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21/train` (label `abcmolmo`; split by its `meta/assembly.json`) | success | real |
+| `abc`, `molmo` | 10 % uniform episode subset (seed 0) of `s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21/train` (label `abcmolmo`; split by its `meta/assembly.json`) | success | real |
 | `oopsie_<lab>` | `s3://tri-ml-datasets-uw2/anthonyliang/oopsie_clean/yam/lerobot/{SE3Labs,Enact,AI2_MOLMOACT2,CMU_Aire/chunk_000..031}` | `success` column | real |
 | `absim` | `s3://tri-ml-datasets-uw2/anthonyliang/oopsie/abc-sim/lerobot_v21` | `meta/episode_labels.jsonl` by global `episode_index` (`success_suboptimal` → success); 54 `trivial_success` dropped | sim |
 
@@ -37,12 +39,18 @@ zeroed per sample, after `Normalize`), per-sample source mix, wandb entity `tri`
 
 ## Build
 
-Download the inputs onto the filesystem that holds `$HF_LEROBOT_HOME` (videos are hardlinked; symlinks otherwise). On a DGX node
-that already has the stage-1 repo, `$HF_LEROBOT_HOME/local/abc_mm2_train_v21` is the `abcmolmo` input.
+Download the inputs onto the filesystem that holds `$HF_LEROBOT_HOME` (videos are hardlinked; symlinks otherwise). For ABC+Molmo
+only the sampled 10 % is staged: `stage_subset.py` writes an s5cmd file for exactly the episodes `--sample abcmolmo=0.10:0`
+keeps (both call `sample_episodes` in assemble_v21.py on the cache's full `meta/episodes.jsonl`; all of `meta/` is staged so
+the assembler sees the same list). 0.10:0 = 16,317 / 163,174 episodes, 46.1M frames, 65,268 files, ~740 GB (estimated from a
+16-episode staging) + ~400 MB meta. On a DGX node that already has the stage-1 repo, pass
+`$HF_LEROBOT_HOME/local/abc_mm2_train_v21` as the `abcmolmo` input instead (same `--sample` picks the same episodes).
 
 ```
-S=s3://tri-ml-datasets-uw2/anthonyliang; IN=$HF_LEROBOT_HOME/../s2_inputs
-aws s3 sync s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21/train $IN/abc_molmo_train   # skip if the stage-1 repo is local
+S=s3://tri-ml-datasets-uw2/anthonyliang; C=s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21/train; IN=$HF_LEROBOT_HOME/../s2_inputs
+mkdir -p $IN/cache_meta; for f in episodes.jsonl info.json tasks.jsonl assembly.json; do AWS_PROFILE=claude-profile aws s3 cp $C/meta/$f $IN/cache_meta/; done
+python yam/pretrain/stage_subset.py $IN/cache_meta $C $IN/abc_molmo_train --sample 0.10:0 --out $IN/abc_molmo_s5cmd.txt
+AWS_PROFILE=claude-profile AWS_REGION=us-west-2 s5cmd run $IN/abc_molmo_s5cmd.txt     # s5cmd needs the region (bucket is us-west-2)
 for u in SE3Labs Enact AI2_MOLMOACT2 CMU_Aire; do aws s3 sync $S/oopsie_clean/yam/lerobot/$u $IN/oopsie/$u; done
 aws s3 sync $S/oopsie/abc-sim/lerobot_v21 $IN/abc_sim
 
@@ -50,11 +58,15 @@ python yam/pretrain/assemble_v21.py $HF_LEROBOT_HOME/local/yam_s2_train_v21 --wo
   --repo abcmolmo=$IN/abc_molmo_train \
   --repo oopsie_SE3Labs=$IN/oopsie/SE3Labs --repo oopsie_Enact=$IN/oopsie/Enact --repo oopsie_AI2_MOLMOACT2=$IN/oopsie/AI2_MOLMOACT2 \
   $(for d in $IN/oopsie/CMU_Aire/chunk_*; do echo --repo oopsie_CMU_Aire=$d; done) \
-  --repo absim=$IN/abc_sim
+  --repo absim=$IN/abc_sim --sample abcmolmo=0.10:0
 python yam/pretrain/build_lowdim_memmap.py $HF_LEROBOT_HOME/local/yam_s2_train_v21
-python yam/pretrain/norm_stats_exact.py $HF_LEROBOT_HOME/local/yam_s2_train_v21 assets/pi05_yam_s2_plain/local/yam_s2_train_v21
-cp -r assets/pi05_yam_s2_plain assets/pi05_yam_s2_meta     # same repo, same stats
 ```
+
+Norm stats are not recomputed: both configs load the 66699 checkpoint's (identical to the cache's
+`meta/norm_stats_pi05_yam_abc_mm2_h32.json` up to 4e-4 in the quantiles). Optional alternative, exact stats over the mix:
+`python yam/pretrain/norm_stats_exact.py <repo> /local/s2_assets/local/yam_s2_train_v21` then train with
+`YAM_S2_ASSETS_DIR=/local/s2_assets` and `--data.assets.asset-id local/yam_s2_train_v21` (the action/state scaling then
+differs from what the init was trained with).
 
 Every output parquet has 14-D `action` / `observation.state` plus `source` (abc|molmo|oopsie_<lab>|absim), `quality` (1/0) and
 `domain` (0 real / 1 sim); `task_index` points into one global task table. `meta/assembly.json` has per-source episode / frame
@@ -94,7 +106,6 @@ python yam/pretrain/assemble_v21.py $HF_LEROBOT_HOME/local/yam_s2_smoke_v21 --wo
   --repo oopsie_SE3Labs=$IN/SE3Labs --repo oopsie_Enact=$IN/Enact --repo absim=$IN/sim \
   --limit oopsie_SE3Labs=50 oopsie_Enact=50 absim=300
 python yam/pretrain/build_lowdim_memmap.py $HF_LEROBOT_HOME/local/yam_s2_smoke_v21
-python yam/pretrain/norm_stats_exact.py $HF_LEROBOT_HOME/local/yam_s2_smoke_v21 assets/pi05_yam_s2_meta/local/yam_s2_smoke_v21
 YAM_ASSEMBLY_JSON=$HF_LEROBOT_HOME/local/yam_s2_smoke_v21/meta/assembly.json <train env as above> \
 uv run scripts/train.py pi05_yam_s2_meta --exp-name s2_smoke --fsdp-devices 8 --overwrite \
   --data.repo-id local/yam_s2_smoke_v21 --num-train-steps 200 --lr-schedule.warmup-steps 20 --save-interval 100 --log-interval 10
