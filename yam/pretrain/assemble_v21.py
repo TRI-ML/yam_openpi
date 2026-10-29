@@ -12,6 +12,7 @@ the per-input rules:
 Inputs with the same label must be adjacent (each source is one contiguous episode/frame range; the trainer's
 source-mix sampler reads those ranges from meta/assembly.json)."""
 import argparse
+import hashlib
 from concurrent.futures import ProcessPoolExecutor
 import json
 import os
@@ -48,6 +49,19 @@ def do_ep(job):
 EXCLUDED_OOPSIE = {"Princeton_PRISM": "action is a copy of observation.state", "Berkeley_HybridRobotics": "single arm (would need action masking)"}
 OOPSIE_CAMS = {"base_0_rgb": "top", "left_wrist_0_rgb": "left_wrist", "right_wrist_0_rgb": "right_wrist"}
 S2_KEEP = ("timestamp", "frame_index")
+
+
+def sample_episodes(episode_indices, frac, seed=0):
+    """Uniform, deterministic FRAC subset of an input's episode indices (sorted). Shared by --sample and stage_subset.py."""
+    ids = np.asarray(sorted(episode_indices), np.int64)
+    n = int(round(frac * len(ids)))
+    return sorted(np.random.default_rng(seed).choice(ids, size=n, replace=False).tolist())
+
+
+def parse_sample(spec):
+    """'FRAC[:SEED]' -> (frac, seed)."""
+    frac, _, seed = spec.partition(":")
+    return float(frac), int(seed or 0)
 
 
 def _fsl14(col, n):
@@ -93,6 +107,12 @@ def repo_episodes(label, d, a):
     d = Path(d); info = json.load(open(d / "meta/info.json"))
     if info["fps"] != FPS: print(f"WARNING {d}: fps {info['fps']} != {FPS} (timestamps kept from the source; action chunks span {FPS / info['fps']:.1f}x the wall time)")
     eps = [json.loads(l) for l in open(d / "meta/episodes.jsonl")]; eps.sort(key=lambda r: r["episode_index"])
+    sample = None
+    if label in a.sample:  # first, on the input's full episode list (identical to stage_subset.py's pick)
+        frac, seed = a.sample[label]; keep = set(sample_episodes([e["episode_index"] for e in eps], frac, seed))
+        sample = {"frac": frac, "seed": seed, "episodes": len(keep), "of": len(eps),
+                  "sha1": hashlib.sha1(json.dumps(sorted(keep)).encode()).hexdigest()}
+        eps = [e for e in eps if e["episode_index"] in keep]
     want = {e["episode_index"] for e in eps}
     stats = {r["episode_index"]: r["stats"] for r in map(json.loads, open(d / "meta/episodes_stats.jsonl")) if r["episode_index"] in want}
     note = None
@@ -127,6 +147,7 @@ def repo_episodes(label, d, a):
         assert len(e["tasks"]) == 1, (d, e["episode_index"])
         recs.append({"dir": str(d), "chunks": info["chunks_size"], "old": e["episode_index"], "task": e["tasks"][0], "length": e["length"],
                      "source": src, "quality": q, "domain": dom, "cams": cams, "stats": _slice_stats(stats[e["episode_index"]], cams), "fps": info["fps"]})
+    if sample: note = f"sampled {sample}" + (f"; {note}" if note else "")
     return recs, note
 
 
@@ -190,6 +211,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("root"); ap.add_argument("sources", nargs="*")
     ap.add_argument("--repo", action="append", default=[], help="stage-2 mode: LABEL=<v2.1 repo dir>, repeatable (see module docstring)")
     ap.add_argument("--cache-sources", nargs="*", default=None, help="stage-2: keep only these abc_molmo_v21 cache sources (its assembly.json keys)")
+    ap.add_argument("--sample", nargs="*", default=[], help="stage-2: LABEL=FRAC[:SEED] keeps a uniform random FRAC of that input's episodes (seed default 0)")
     ap.add_argument("--limit", nargs="*", default=[], help="stage-2: LABEL=N keeps the first N episodes of each input with that label"); ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--robot-type", default="yam_bimanual")
     ap.add_argument("--skip", nargs="*", default=[], help="source dir names to skip (e.g. camera-less tasks)")
@@ -199,6 +221,7 @@ def main():
     if a.repo:
         assert not a.sources, "--repo (stage-2) and staged source dirs cannot be mixed"
         a.limit = {k: int(v) for k, v in (x.split("=", 1) for x in a.limit)}
+        a.sample = {k: parse_sample(v) for k, v in (x.split("=", 1) for x in a.sample)}
         return main_repos(a)
     excl = {k: set(int(x) for x in open(f).read().split()) for k, f in (e.split(":", 1) for e in a.exclude)}
     only = {k: set(int(x) for x in open(f).read().split()) for k, f in (e.split(":", 1) for e in (a.only or []))}
