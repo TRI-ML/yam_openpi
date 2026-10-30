@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import os
 from typing import Protocol
 
 from etils import epath
@@ -77,6 +78,8 @@ def initialize_checkpoint_dir(
             max_to_keep=max_to_keep,
             keep_period=keep_period,
             create=False,
+            # OPENPI_ASYNC_CKPT=0 (SageMaker) = synchronous saves: the step dir is committed when save() returns.
+            enable_async_checkpointing=os.environ.get("OPENPI_ASYNC_CKPT", "1") != "0",
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )

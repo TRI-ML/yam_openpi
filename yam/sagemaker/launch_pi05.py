@@ -44,12 +44,14 @@ def main():
         spot = "spot" in qkey; qname = QUEUE[qkey]
         stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         job_name = re.sub(r"[^a-zA-Z0-9-]", "-", f"pi05-yam-{a.mode}-{qkey}-{USER}-{stamp}")[:63].strip("-")
-        ckpt_uri = f"s3://tri-ml-datasets-uw2/tri-yam/train_runs/{a.cfg}/{a.exp}/checkpoints_{qkey}"
+        # sm_entry.sh uploads committed steps here itself (layout kept from the old /opt/ml/checkpoints mirror: <cfg>/<exp> nested).
+        # No checkpoint_s3_uri: SageMaker's sync agent raced orbax's in-progress writes ("Artifact upload failed").
+        ckpt_uri = f"s3://tri-ml-datasets-uw2/tri-yam/train_runs/{a.cfg}/{a.exp}/checkpoints_{qkey}/{a.cfg}/{a.exp}"
         # reserved-capacity (on-demand) queues require SM_USE_RESERVED_CAPACITY=1; spot/training-plan queues want 0 (same rule as vla_foundry)
-        env = dict(base_env, SM_QUEUE=qkey, SM_CHECKPOINT_S3_URI=ckpt_uri, SM_USE_RESERVED_CAPACITY=("0" if spot else "1"))
+        env = dict(base_env, SM_QUEUE=qkey, CK_URI=ckpt_uri, SM_USE_RESERVED_CAPACITY=("0" if spot else "1"))
         est = Estimator(image_uri=a.image, role=ROLE, instance_count=1, instance_type="ml.p5.48xlarge", sagemaker_session=sess,
                         volume_size=a.volume_size, max_run=max_run, max_wait=max_run if spot else None, use_spot_instances=spot,
-                        checkpoint_s3_uri=ckpt_uri, checkpoint_local_path="/opt/ml/checkpoints", environment=env,
+                        environment=env,
                         output_path=f"s3://tri-ml-datasets-uw2/tri-yam/train_runs/{a.cfg}/{a.exp}/sm_output_{qkey}",
                         keep_alive_period_in_seconds=None, debugger_hook_config=False, disable_profiler=True,
                         tags=[{"Key": "tri.project", "Value": "MM:PJ-0077"}, {"Key": "tri.owner.email", "Value": "anthony.liang@tri.global"},

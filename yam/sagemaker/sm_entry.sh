@@ -1,9 +1,11 @@
 #!/bin/bash
 # SageMaker entrypoint: stage Zheyuan's v3ar LeRobot repos -> lossless v2.1 train/val repos -> exact norm stats -> pi05 training
-# with checkpoints in /opt/ml/checkpoints (SageMaker mirrors it to checkpoint_s3_uri; on restart we --resume from it).
+# with orbax checkpoints in local scratch ($W/checkpoints, never /opt/ml/checkpoints: SageMaker's sync agent raced orbax's writes); a background
+# uploader (ckpt_sync.sh) copies committed steps to CK_URI every 5 min; on (re)start the latest committed step of RESUME_FROM_URI is restored + --resume.
 # Stage 2 (CFG=pi05_yam_s2_*, docs/STAGE2.md): fetches the prebuilt merged repo from DATA_CACHE_URI (needs _COMPLETE), no norm stats
 # (init params + assets are S3 paths in the config), then the same resume/train/publish steps.
 # Env (set by the launcher): CFG EXP MODE(full|smoke) SRC_ROOT DATA_CACHE_URI OUT_URI OPENPI_CACHE_URI WANDB_* TRAIN_OVERRIDES
+#   CK_URI (default $OUT_URI/$EXP/checkpoints_$SM_QUEUE/$CFG/$EXP) RESUME_FROM_URI (default CK_URI) CKPT_SYNC_EVERY (s, 300)
 #   SMOKE_ABC_TASKS (smoke: space-separated ABC task dirs) SMOKE_VAL_TASKS FSDP_DEVICES
 set -uo pipefail
 [ "${1:-}" = "train" ] && shift
@@ -15,20 +17,22 @@ else DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_
 OUT_URI=${OUT_URI:-s3://tri-ml-datasets-uw2/tri-yam/train_runs/$CFG}
 OPENPI_CACHE_URI=${OPENPI_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/openpi_cache}
 MOLMO_WEBBED=${MOLMO_WEBBED:-s3://tri-ml-datasets-uw2/geyan/anydata/cv_webbed/videos/molmoact2_v2}
-CK=${SM_CHECKPOINT_DIR:-/opt/ml/checkpoints}; FSDP_DEVICES=${FSDP_DEVICES:-8}
+FSDP_DEVICES=${FSDP_DEVICES:-8}
 CODE=${CODE:-/opt/ml/code/yam_openpi}; S=$CODE/yam/pretrain; PY=$CODE/.venv/bin/python
+CK_URI=${CK_URI:-$OUT_URI/$EXP/checkpoints_${SM_QUEUE:-default}/$CFG/$EXP}; RESUME_FROM_URI=${RESUME_FROM_URI:-$CK_URI}
 log(){ echo "$(date -u +%FT%TZ) [sm_entry] $*"; }
 
 # 0. scratch = the biggest free filesystem (p5: NVMe under /opt/ml or /tmp)
 best=""; bestf=0
 for d in ${SCRATCH_CANDIDATES:-/opt/ml /tmp /mnt /scratch}; do [ -d $d ] || continue; f=$(df -Pk $d 2>/dev/null | awk 'NR==2{print $4}'); [ "${f:-0}" -gt "$bestf" ] && { best=$d; bestf=$f; }; done
 export W=${W_OVERRIDE:-$best/pi05_work}; mkdir -p $W/{data,stage,stage_val,lerobot_home/local,openpi_cache,hf_home,jax_cache,logs}
-log "cfg=$CFG exp=$EXP mode=$MODE scratch=$W ($((bestf/1024/1024)) GB free) ckpt=$CK"; df -h $W $CK 2>/dev/null | tail -2; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -8
+log "cfg=$CFG exp=$EXP mode=$MODE scratch=$W ($((bestf/1024/1024)) GB free) ckpt_uri=$CK_URI resume_from=$RESUME_FROM_URI"; df -h $W | tail -1; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -8
 export HF_LEROBOT_HOME=$W/lerobot_home OPENPI_DATA_HOME=$W/openpi_cache HF_HOME=$W/hf_home JAX_COMPILATION_CACHE_DIR=$W/jax_cache
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9} LEROBOT_SKIP_TS_CHECK=1 FFMPEG=/opt/tools/ffmpeg FFPROBE=/opt/tools/ffprobe
 export WANDB_ENTITY=${WANDB_ENTITY:-tri} WANDB_DIR=$W/logs
 export XLA_FLAGS="${XLA_FLAGS:---xla_gpu_enable_latency_hiding_scheduler=true --xla_gpu_enable_triton_gemm=true}" LEROBOT_LOWDIM_MEMMAP=1
-S5="s5cmd --numworkers ${S5_WORKERS:-256} --retry-count 10"
+export OPENPI_ASYNC_CKPT=${OPENPI_ASYNC_CKPT:-0}  # synchronous orbax saves: a step dir is final when save() returns
+S5="s5cmd --numworkers ${S5_WORKERS:-256} --retry-count 10"; source $CODE/yam/sagemaker/ckpt_sync.sh
 cd $CODE
 
 # 1. pi05_base + tokenizer
@@ -111,17 +115,23 @@ export YAM_ASSEMBLY_JSON=$TRAIN/meta/assembly.json
 cp $TRAIN/meta/assembly.json $TRAIN/meta/info.json assets/$CFG/local/abc_mm2_train_v21/norm_stats.json $W/logs/ 2>/dev/null
 $S5 cp $W/logs/ "$OUT_URI/$EXP/logs_prep/" >/dev/null 2>&1 || true
 
-# 6. resume? (SageMaker restored checkpoint_s3_uri into $CK before start)
-CKD=$CK/$CFG/$EXP; RESUME=""
-if [ -d $CKD ]; then
-  for d in $CKD/[0-9]*; do [ -d "$d" ] && [ ! -f "$d/_CHECKPOINT_METADATA" ] && { log "removing incomplete ckpt $d"; rm -rf "$d"; }; done
-  rm -rf $CKD/*.orbax-checkpoint-tmp-* 2>/dev/null
-  if ls -d $CKD/[0-9]* >/dev/null 2>&1 && [ -f $CKD/wandb_id.txt ]; then RESUME="--resume"; log "RESUMING from $(ls -d $CKD/[0-9]* | sort -V | tail -1)"; else rm -rf $CKD; fi
+# 6. resume: local scratch is empty on a fresh instance, so restore the latest committed step of RESUME_FROM_URI (orbax tmp dirs are ignored)
+CK=$W/checkpoints; CKD=$CK/$CFG/$EXP; RESUME=""
+rm -rf $CKD/*.orbax-checkpoint-tmp-* 2>/dev/null
+if [ -n "$(local_steps $CKD)" ] && [ -f $CKD/wandb_id.txt ]; then RESUME="--resume"; log "RESUMING from local $(local_steps $CKD | tail -1)"
+else
+  rm -rf $CKD; st=$(resume_latest "$RESUME_FROM_URI" $CKD); rrc=$?
+  case $rrc in
+    0) RESUME="--resume"; log "RESUMING from $RESUME_FROM_URI/$st";;
+    1) rm -rf $CKD; log "no committed step under $RESUME_FROM_URI: fresh start";;
+    *) log "FATAL committed steps exist under $RESUME_FROM_URI but the restore failed; not starting fresh over them"; exit 6;;
+  esac
 fi
 mkdir -p $CK
+( while true; do sleep ${CKPT_SYNC_EVERY:-300}; [ -d $CKD ] && sync_pass $CKD "$CK_URI"; done ) >> $W/logs/ckpt_sync.log 2>&1 & SYNC_PID=$!
 
 # 7. val eval watcher (CPU) on finished checkpoints -> wandb run ${EXP}_eval; stops (after a final pass) when training ends
-eval_pass(){ for d in $(ls -d $CKD/[0-9]* 2>/dev/null | sort -V); do st=$(basename $d); grep -qx "$st" $W/logs/eval_done.txt && continue
+eval_pass(){ for st in $(local_steps $CKD); do d=$CKD/$st; grep -qx "$st" $W/logs/eval_done.txt && continue
     [ -f $d/_CHECKPOINT_METADATA ] && [ -d $d/params ] || continue
     log "eval ckpt $st"; t0=$(date +%s)
     if JAX_PLATFORMS=cpu $PY $S/eval_ckpt.py --config $CFG --ckpt $d --val-repo local/abc_mm2_val_v21 --wandb-run ${EXP}_eval --n-per-source ${EVAL_N:-192} >> $W/logs/eval.log 2>&1; then
@@ -140,8 +150,9 @@ export WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,abc130k_v3ar,molmoact2
 $PY scripts/train.py $CFG --exp-name $EXP --checkpoint-base-dir $CK --fsdp-devices $FSDP_DEVICES $RESUME ${TRAIN_OVERRIDES:-} 2>&1 | tee -a $W/logs/train.log
 rc=${PIPESTATUS[0]}; log "train exited rc=$rc"
 touch $W/STOP_EVAL; [ -n "$EVAL_PID" ] && { log "waiting for the eval watcher's final pass"; timeout ${EVAL_FINAL_TIMEOUT:-7200} tail --pid=$EVAL_PID -f /dev/null; }
-# 9. publish final params + logs
-LAST=$(ls -d $CKD/[0-9]* 2>/dev/null | sort -V | tail -1)
-if [ -n "$LAST" ]; then log "publishing $LAST -> $OUT_URI/$EXP/final/"; $S5 cp $LAST/ "$OUT_URI/$EXP/final/$(basename $LAST)/" >/dev/null || log "WARN final copy failed"; fi
+# 9. last checkpoint sync (stop the loop first: one writer), then final params (committed steps only) + logs
+pkill -TERM -P $SYNC_PID 2>/dev/null; kill $SYNC_PID 2>/dev/null; wait $SYNC_PID 2>/dev/null; sync_pass $CKD "$CK_URI" >> $W/logs/ckpt_sync.log 2>&1
+LAST=$(local_steps $CKD | tail -1)
+if [ -n "$LAST" ]; then log "publishing $LAST -> $OUT_URI/$EXP/final/"; put_step $CKD/$LAST "$OUT_URI/$EXP/final" || log "WARN final copy failed"; fi
 $S5 cp $W/logs/ "$OUT_URI/$EXP/logs/" >/dev/null 2>&1 || true
 kill $(jobs -p) 2>/dev/null; exit $rc

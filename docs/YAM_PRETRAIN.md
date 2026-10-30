@@ -96,8 +96,8 @@ NCCL over IB) and `mh_run.sh`; `scripts/train.py` initialises `jax.distributed` 
 negative-lookup race on the checkpoint dir) and the switch procedure: `yam/multihost/MULTIHOST.md`.
 
 **SageMaker (1x ml.p5.48xlarge via the AWS Batch service queues)** — `yam/sagemaker/`: `Dockerfile` (build from the repo root),
-`sm_entry.sh` (stage from the v3 sources or the S3 cache → convert → assemble → memmaps → norm stats → train; checkpoints in
-`/opt/ml/checkpoints` so SageMaker mirrors them and a spot restart `--resume`s; final params + eval jsons + logs to
+`sm_entry.sh` (stage from the v3 sources or the S3 cache → convert → assemble → memmaps → norm stats → train; orbax checkpoints in
+local scratch, committed steps uploaded by `ckpt_sync.sh` and restored + `--resume`d on restart, docs/STAGE2.md "SageMaker"; final params + eval jsons + logs to
 `s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/`), `launch_pi05.py` (submits to the `vla` and `vla-spot` queues at
 priority 300 (OFFICIAL tier); the on-demand queue needs `SM_USE_RESERVED_CAPACITY=1`), `race_watch.sh` (terminates the losing twin once one job
 trains). Measured 1.06–1.18 s/step at batch 128 on 8xH100.

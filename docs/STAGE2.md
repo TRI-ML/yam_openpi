@@ -126,9 +126,18 @@ behaviour). Consequence: `<quality=success> <domain=sim>` has no training data u
 `$DATA_CACHE_URI/_COMPLETE` (default `s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2_train_v21`), copies
 `$DATA_CACHE_URI/train/` (31,940 eps, 883 GB, with `meta/assembly.json` and `lowdim_mm/`) to
 `$HF_LEROBOT_HOME/local/yam_s2_train_v21`, and exports `YAM_ASSEMBLY_JSON`. It skips norm stats and the abc_mm2 asset copy;
-the config pulls the 66699 params and assets from S3 with the image's aws cli. Then the usual steps: checkpoints in
-`/opt/ml/checkpoints` (mirrored to `checkpoint_s3_uri`), `--resume` when that dir is restored, final step + logs to
-`s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/{final,logs}/`. There is no val watcher (no `abc_mm2_val_v21` is staged).
+the config pulls the 66699 params and assets from S3 with the image's aws cli. Then the usual steps: resume, train, and publish the final step + logs to
+`s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/{final,logs}/`.
+
+**Checkpoints** (`yam/sagemaker/ckpt_sync.sh`; self-check `bash yam/sagemaker/test_ckpt_sync.sh`). `/opt/ml/checkpoints` and
+`checkpoint_s3_uri` are not used. The first plain run died at its 10k save with an orbax `JSONDecodeError` and "Artifact upload failed":
+SageMaker's sync agent was uploading orbax's in-progress files, so `.orbax-checkpoint-tmp-*` dirs ended up on S3. Now train.py
+writes to local scratch (`$W/checkpoints/<cfg>/<exp>`) with synchronous orbax saves (`OPENPI_ASYNC_CKPT=0`). Every 5 min
+(`CKPT_SYNC_EVERY`), plus once after training, a background uploader copies each committed step to
+`CK_URI = s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/checkpoints_<qkey>/<cfg>/<exp>/<step>/`. A committed step has an
+all-digit name and contains `_CHECKPOINT_METADATA`; on S3 the uploader writes `_UPLOADED` after all its other files. The uploader
+also copies `wandb_id.txt` and prunes S3 to the config's keep policy: every 20k plus the last 2 (`KEEP_PERIOD`, `KEEP_LAST`).
+`final/<step>/` is written the same way. There is no val watcher (no `abc_mm2_val_v21` is staged).
 `--mode smoke` = 200 steps (warmup 20, save every 100) on the same repo, which still fetches all 883 GB.
 
 **`_COMPLETE` marker** (same convention as `abc_molmo_v21`): write it at the prefix root only after the `train/` upload has finished
@@ -164,10 +173,16 @@ done
 model and batch) ran at 1.06-1.18 s/step on 8xH100. Assuming stage 2 is about as fast on H100, 60k steps take about 18-20 h.
 Add the 883 GB fetch and JIT compile (assumed under 1 h) on every (re)start. `--max-run-days 2` leaves room for a couple of spot restarts.
 
-**Resume after a spot interruption.** Managed spot restarts the job on its own: SageMaker restores `checkpoint_s3_uri` into
-`/opt/ml/checkpoints`, sm_entry deletes incomplete step dirs, re-fetches the repo and trains with `--resume` (the same wandb run
-via `wandb_id.txt`). Checkpoints are saved every 10k steps, so a restart can lose up to 10k steps. For spot, `max_wait` equals
-`max_run` and covers waiting time too. If the job ends before 60k (max_wait reached, or terminated), relaunch with the same `--cfg`/`--exp` on
-the queue that won: the checkpoint URI is per queue
-(`s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/checkpoints_<vla|vla-spot>`), e.g. `--queues vla-spot`. To race again,
-first `aws s3 sync .../checkpoints_vla-spot/ .../checkpoints_vla/`, so that either twin resumes.
+**Resume.** On every start, sm_entry restores the latest step under `RESUME_FROM_URI` (default `CK_URI`) that has `_UPLOADED`,
+together with `wandb_id.txt` (so it continues the same wandb run), and passes `--resume`. Orbax tmp dirs and partial uploads are ignored.
+- No committed step: fresh start. `--overwrite` is never passed.
+- Committed steps exist but the restore fails: the job exits (code 6) rather than start over on top of them.
+
+Managed spot restarts the container on its own. A restart re-fetches the repo and loses at most the steps since the last uploaded
+save (saves are every 10k; add `--save-interval 5000` to `TRAIN_OVERRIDES` to halve that). For spot, `max_wait` equals `max_run`
+and also counts the time spent waiting. If the job ends before 60k, relaunch with the same `--cfg`/`--exp`:
+- On the queue that won, which then resumes from its own `checkpoints_<qkey>`.
+- Or on both queues, with `--env RESUME_FROM_URI=<the winner's CK_URI>` so that either twin resumes from it.
+
+The first plain run (2026-10-30) left only an uncommitted `5000.orbax-checkpoint-tmp-0` (incomplete train_state), so its
+relaunch starts from step 0. That leftover is ignored, and can be deleted with `aws s3 rm --recursive`.
