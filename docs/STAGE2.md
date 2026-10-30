@@ -119,3 +119,55 @@ ABC-sim outcomes are `success_suboptimal` / `failure`; a policy rollout that mer
 train `<quality=success>`. The assembler keeps only the 13,948 failures by default (`--absim-keep failure`; `--absim-keep all` restores the old
 behaviour). Consequence: `<quality=success> <domain=sim>` has no training data until ABC's ~400 h sim teleop is added; sim eval prompts it anyway
 (compositional). Mix is 0.40 / 0.35 / 0.25 (abc+molmo / oopsie / absim).
+
+## SageMaker (1x ml.p5.48xlarge per run, AWS Batch `vla` + `vla-spot` race)
+
+`yam/sagemaker/sm_entry.sh` treats any `CFG=pi05_yam_s2*` as stage 2: it does not build anything. It needs
+`$DATA_CACHE_URI/_COMPLETE` (default `s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2_train_v21`), copies
+`$DATA_CACHE_URI/train/` (31,940 eps, 883 GB, with `meta/assembly.json` and `lowdim_mm/`) to
+`$HF_LEROBOT_HOME/local/yam_s2_train_v21`, and exports `YAM_ASSEMBLY_JSON`. It skips norm stats and the abc_mm2 asset copy;
+the config pulls the 66699 params and assets from S3 with the image's aws cli. Then the usual steps: checkpoints in
+`/opt/ml/checkpoints` (mirrored to `checkpoint_s3_uri`), `--resume` when that dir is restored, final step + logs to
+`s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/{final,logs}/`. There is no val watcher (no `abc_mm2_val_v21` is staged).
+`--mode smoke` = 200 steps (warmup 20, save every 100) on the same repo, which still fetches all 883 GB.
+
+**`_COMPLETE` marker** (same convention as `abc_molmo_v21`): write it at the prefix root only after the `train/` upload has finished
+and been checked, because jobs refuse to start without it.
+```
+aws s3 ls --recursive --summarize s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2_train_v21/train/ | tail -2   # ~883 GB
+echo "$(date -u) yam_s2_train_v21 31940 eps" | aws s3 cp - s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2_train_v21/_COMPLETE
+```
+
+**Image** (repo root on this branch; `COPY .` plus `uv sync --frozen`, awscli v2 + s5cmd included; the build imports both s2 configs):
+```
+export AWS_PROFILE=sagemaker AWS_REGION=us-west-2; ECR=124224456861.dkr.ecr.us-west-2.amazonaws.com
+aws ecr get-login-password | docker login --username AWS --password-stdin $ECR
+IMG=$ECR/anthonyliang-openpi:s2-$(git rev-parse --short HEAD)
+docker build -f yam/sagemaker/Dockerfile -t $IMG . && docker push $IMG
+```
+
+**Launch** (the launcher needs the sagemaker SDK, e.g. `~/Documents/vla_foundry/.venv/bin/python`; it reads `WANDB_API_KEY` from
+`~/Documents/vla_foundry/secrets.env` and sets wandb `tri/openpi`). The default is priority 300 (OFFICIAL). Each run submits 2 jobs
+(on-demand + spot), so both runs together hit the 4-node cap until the race watchers kill the losers.
+```
+PY=~/Documents/vla_foundry/.venv/bin/python; export AWS_PROFILE=sagemaker
+OV="TRAIN_OVERRIDES=--fsdp-devices 8 --batch-size 128 --num-train-steps 60000 --lr-schedule.decay-steps 60000 --num-workers 32"
+for v in plain meta; do
+  $PY yam/sagemaker/launch_pi05.py --image $IMG --cfg pi05_yam_s2_$v --exp pi05_yam_s2_${v}_sm_p5 --max-run-days 2 --env "$OV"
+  nohup bash yam/sagemaker/race_watch.sh /tmp/pi05_sm/jobs_pi05_yam_s2_${v}_sm_p5.json > /dev/null 2>&1 &
+done
+# winner: /tmp/pi05_sm/jobs_<exp>.winner; log: /tmp/pi05_sm/logs/race_watch.log
+# smoke first (optional): --mode smoke --exp pi05_yam_s2_meta_sm_smoke --max-run-days 0.5, without --env "$OV"
+```
+
+**Expected time** (an estimate, not measured on p5): stage 2 on 8xA100 runs at 1.82 s/step at 16 samples/device. Stage 1 (same
+model and batch) ran at 1.06-1.18 s/step on 8xH100. Assuming stage 2 is about as fast on H100, 60k steps take about 18-20 h.
+Add the 883 GB fetch and JIT compile (assumed under 1 h) on every (re)start. `--max-run-days 2` leaves room for a couple of spot restarts.
+
+**Resume after a spot interruption.** Managed spot restarts the job on its own: SageMaker restores `checkpoint_s3_uri` into
+`/opt/ml/checkpoints`, sm_entry deletes incomplete step dirs, re-fetches the repo and trains with `--resume` (the same wandb run
+via `wandb_id.txt`). Checkpoints are saved every 10k steps, so a restart can lose up to 10k steps. For spot, `max_wait` equals
+`max_run` and covers waiting time too. If the job ends before 60k (max_wait reached, or terminated), relaunch with the same `--cfg`/`--exp` on
+the queue that won: the checkpoint URI is per queue
+(`s3://tri-ml-datasets-uw2/tri-yam/train_runs/<cfg>/<exp>/checkpoints_<vla|vla-spot>`), e.g. `--queues vla-spot`. To race again,
+first `aws s3 sync .../checkpoints_vla-spot/ .../checkpoints_vla/`, so that either twin resumes.

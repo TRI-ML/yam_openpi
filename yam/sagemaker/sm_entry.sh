@@ -1,13 +1,17 @@
 #!/bin/bash
 # SageMaker entrypoint: stage Zheyuan's v3ar LeRobot repos -> lossless v2.1 train/val repos -> exact norm stats -> pi05 training
 # with checkpoints in /opt/ml/checkpoints (SageMaker mirrors it to checkpoint_s3_uri; on restart we --resume from it).
+# Stage 2 (CFG=pi05_yam_s2_*, docs/STAGE2.md): fetches the prebuilt merged repo from DATA_CACHE_URI (needs _COMPLETE), no norm stats
+# (init params + assets are S3 paths in the config), then the same resume/train/publish steps.
 # Env (set by the launcher): CFG EXP MODE(full|smoke) SRC_ROOT DATA_CACHE_URI OUT_URI OPENPI_CACHE_URI WANDB_* TRAIN_OVERRIDES
 #   SMOKE_ABC_TASKS (smoke: space-separated ABC task dirs) SMOKE_VAL_TASKS FSDP_DEVICES
 set -uo pipefail
 [ "${1:-}" = "train" ] && shift
 CFG=${CFG:-pi05_yam_abc_mm2_h32}; EXP=${EXP:-pi05_full_yam_abc_mm2_h32_sm_p5}; MODE=${MODE:-full}
 SRC_ROOT=${SRC_ROOT:-s3://sagemaker-us-west-2-124224456861/zheyuan.hu/data}
-DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21}
+S2=0; case $CFG in pi05_yam_s2*) S2=1;; esac
+if [ $S2 = 1 ]; then DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2_train_v21}
+else DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21}; fi
 OUT_URI=${OUT_URI:-s3://tri-ml-datasets-uw2/tri-yam/train_runs/$CFG}
 OPENPI_CACHE_URI=${OPENPI_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/openpi_cache}
 MOLMO_WEBBED=${MOLMO_WEBBED:-s3://tri-ml-datasets-uw2/geyan/anydata/cv_webbed/videos/molmoact2_v2}
@@ -40,6 +44,20 @@ stage_convert(){ # $1 = s3 repo uri, $2 = local repo dir, $3 = stage out dir
   $PY $S/convert_source.py $2 $3 --workers ${CONV_WORKERS:-48} >> $W/logs/convert.log 2>&1 || { log "convert FAILED $1"; return 1; }
   [ "${KEEP_RAW:-0}" = "1" ] || rm -rf $2
 }
+if [ $S2 = 1 ]; then
+  # 2'. stage 2: fetch only (the repo is built offline, docs/STAGE2.md "Build"); smoke = 200 steps on the same repo
+  TRAIN=$HF_LEROBOT_HOME/local/yam_s2_train_v21
+  if [ ! -f $TRAIN/meta/assembly.json ]; then
+    $S5 ls "$DATA_CACHE_URI/_COMPLETE" >/dev/null 2>&1 || { log "FATAL no $DATA_CACHE_URI/_COMPLETE (upload unfinished?)"; exit 2; }
+    log "data cache hit: $DATA_CACHE_URI/train -> $TRAIN"; t0=$(date +%s); mkdir -p $TRAIN
+    $S5 cp "$DATA_CACHE_URI/train/*" $TRAIN/ >/dev/null || { log "FATAL s2 repo fetch failed"; exit 2; }
+    log "fetched in $(( $(date +%s)-t0 ))s"; df -h $W | tail -1
+  fi
+  [ -f $TRAIN/meta/assembly.json ] || { log "FATAL $TRAIN/meta/assembly.json missing"; exit 2; }
+  [ -f $TRAIN/lowdim_mm/action.npy ] || $PY $S/build_lowdim_memmap.py $TRAIN --workers 48 >> $W/logs/memmap.log 2>&1 || { log "FATAL train memmap failed"; exit 5; }
+  [ "$MODE" = "smoke" ] && TRAIN_OVERRIDES="--num-train-steps 200 --lr-schedule.warmup-steps 20 --save-interval 100 --log-interval 10 ${TRAIN_OVERRIDES:-}"
+  WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,stage2,yam_s2_train_v21,joint14_abs,horizon32,sagemaker,h100}
+else
 t_stage0=$(date +%s)
 # 2. data: cache first
 if [ "$MODE" = "full" ] && $S5 ls "$DATA_CACHE_URI/_COMPLETE" >/dev/null 2>&1 && [ ! -f $TRAIN/meta/info.json ]; then
@@ -87,6 +105,7 @@ else
   mkdir -p assets/$CFG/local/abc_mm2_train_v21; cp $TRAIN/meta/norm_stats_$CFG.json assets/$CFG/local/abc_mm2_train_v21/norm_stats.json 2>/dev/null || \
     $PY $S/norm_stats_exact.py $TRAIN assets/$CFG/local/abc_mm2_train_v21 --workers 64 >> $W/logs/norm_stats.log 2>&1
 fi
+fi  # S2
 jq -c '{total_episodes,total_frames,total_tasks,fps}' $TRAIN/meta/info.json; [ -f $VAL/meta/info.json ] && jq -c '{val_episodes:.total_episodes,val_frames:.total_frames}' $VAL/meta/info.json
 export YAM_ASSEMBLY_JSON=$TRAIN/meta/assembly.json
 cp $TRAIN/meta/assembly.json $TRAIN/meta/info.json assets/$CFG/local/abc_mm2_train_v21/norm_stats.json $W/logs/ 2>/dev/null
