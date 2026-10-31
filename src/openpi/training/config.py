@@ -91,6 +91,14 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Stage-2 YAM (docs/STAGE2.md), training-only. If set (with prompt_from_task), the prompt is
+    # `<quality=..> <domain=..> <task>` with the prefix dropped with this probability (QualityDomainPrefixPrompt).
+    meta_prefix_dropout: float | None = None
+    # Zero the normalized state with this probability per sample (StateDropout, right after Normalize).
+    state_dropout: float = 0.0
+    # Per-sample source mix over the stage-2 `source` labels in <repo>/meta/assembly.json (SourceMixSampler):
+    # "a+b" pools sources frame-proportionally, a glob ("oopsie_*") splits its weight equally over the matches.
+    source_mix: dict[str, float] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -584,6 +592,8 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Number of most recent checkpoints kept in addition to the keep_period ones.
+    max_to_keep: int = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -592,6 +602,8 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+    # wandb entity (team); None = the logged-in user's default entity.
+    wandb_entity: str | None = None
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -966,6 +978,73 @@ _CONFIGS = [
         log_interval=5,
         wandb_enabled=False,
     ),
+    # Stage-2 YAM pretraining (docs/STAGE2.md): pi05_yam_abc_mm2_h32 continued from the 3-node run's step 66699 (params
+    # only, fresh optimizer) on ABC+MolmoAct2 + oopsie-YAM (4 labs) + ABC-sim, merged by assemble_v21.py --repo into
+    # local/yam_s2_train_v21, mixed per sample 0.35 / 0.35 (labs equal) / 0.30. The two configs differ ONLY in the prompt.
+    *[
+        TrainConfig(
+            name=name,
+            project_name="openpi",
+            wandb_entity="tri",
+            model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+            data=SimpleDataConfig(
+                repo_id="local/yam_s2_train_v21",
+                # Norm stats the 66699 init was trained with (not recomputed on the mix); YAM_S2_ASSETS_DIR or
+                # --data.assets.assets-dir for a local copy (s3:// is synced with the aws cli).
+                assets=AssetsConfig(
+                    assets_dir=os.environ.get(
+                        "YAM_S2_ASSETS_DIR",
+                        "s3://tri-ml-datasets-uw2/tri-yam/train_runs/pi05_yam_abc_mm2_h32/pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66699/assets",
+                    ),
+                    asset_id="local/abc_mm2_train_v21",
+                ),
+                data_transforms=lambda model: _transforms.Group(
+                    inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                    outputs=[yam_policy.YAMOutputs()],
+                ),
+                base_config=DataConfig(
+                    repack_transforms=_transforms.Group(
+                        inputs=[
+                            _transforms.RepackTransform(
+                                {
+                                    "observation/image_head": "observation.images.top",
+                                    "observation/image_left_wrist": "observation.images.left_wrist",
+                                    "observation/image_right_wrist": "observation.images.right_wrist",
+                                    "observation/state": "observation.state",
+                                    "actions": "action",
+                                    "prompt": "prompt",
+                                }
+                            )
+                        ]
+                    ),
+                    prompt_from_task=True,
+                    meta_prefix_dropout=meta_prefix_dropout,
+                    state_dropout=0.1,
+                    source_mix={"abc+molmo": 0.40, "oopsie_*": 0.35, "absim": 0.25},  # absim = failures only (2026-10-29)
+                    action_sequence_keys=("action",),
+                ),
+            ),
+            # Point at a local copy with --weight-loader.params-path or YAM_S2_INIT_PARAMS (the default syncs from S3).
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                os.environ.get(
+                    "YAM_S2_INIT_PARAMS",
+                    "s3://tri-ml-datasets-uw2/tri-yam/train_runs/pi05_yam_abc_mm2_h32/pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66699/params",
+                )
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-4),
+            ema_decay=0.99,
+            log_interval=50,
+            batch_size=128,
+            num_workers=32,
+            fsdp_devices=8,
+            lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=1e-5, decay_steps=60_000, decay_lr=1e-6),
+            num_train_steps=60_000,
+            save_interval=10_000,
+            keep_period=20_000,
+            max_to_keep=2,
+        )
+        for name, meta_prefix_dropout in (("pi05_yam_s2_plain", None), ("pi05_yam_s2_meta", 0.3))
+    ],
     # Fine-tune TEMPLATE from a YAM pretrain checkpoint onto one of our station LeRobot v2.1 repos (yam-data materialization,
     # cameras scene/left_wrist/right_wrist as observation.images.<camera>). Point the weight loader at a pretrain `params`
     # dir (env YAM_PRETRAIN_PARAMS, e.g. s3://.../pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66700/params downloaded
