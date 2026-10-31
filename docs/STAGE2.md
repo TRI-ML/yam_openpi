@@ -64,8 +64,8 @@ python yam/pretrain/build_lowdim_memmap.py $HF_LEROBOT_HOME/local/yam_s2_train_v
 
 Norm stats are not recomputed: both configs load the 66699 checkpoint's (identical to the cache's
 `meta/norm_stats_pi05_yam_abc_mm2_h32.json` up to 4e-4 in the quantiles). Optional alternative, exact stats over the mix:
-`python yam/pretrain/norm_stats_exact.py <repo> /local/s2_assets/local/yam_s2_train_v21` then train with
-`YAM_S2_ASSETS_DIR=/local/s2_assets` and `--data.assets.asset-id local/yam_s2_train_v21` (the action/state scaling then
+`python yam/pretrain/norm_stats_exact.py <repo> <assets_dir>/local/yam_s2_train_v21` then train with
+`YAM_S2_ASSETS_DIR=<assets_dir>` and `--data.assets.asset-id local/yam_s2_train_v21` (the action/state scaling then
 differs from what the init was trained with).
 
 Every output parquet has 14-D `action` / `observation.state` plus `source` (abc|molmo|oopsie_<lab>|absim), `quality` (1/0) and

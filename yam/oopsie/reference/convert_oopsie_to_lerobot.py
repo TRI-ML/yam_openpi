@@ -91,7 +91,7 @@ class Args:
     labs: tuple[str, ...] = ("CMU_Auton", "USP_MB")
     episodes_per_lab: int = 3
     overwrite: bool = False
-    cache_dir: Path = Path("/home/anthonyliang/.claude/jobs/d70b14fe/tmp/pi05_smoke/convert_cache")
+    cache_dir: Path = Path("/tmp/oopsie_convert_cache")
 
 
 def _aws_cp(key: str, dst: Path) -> None:

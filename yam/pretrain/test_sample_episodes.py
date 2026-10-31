@@ -2,7 +2,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from assemble_v21 import parse_sample, sample_episodes  # noqa: E402
+from assemble_v21 import parse_sample, sample_episodes
 
 
 def test_sample_episodes():

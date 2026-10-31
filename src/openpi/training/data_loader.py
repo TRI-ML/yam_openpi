@@ -94,7 +94,7 @@ class IterableTransformedDataset(IterableDataset[T_co]):
                 batch_size = next(v.shape[0] for v in sample.values())
 
                 # Split batch into individual samples using tree_map
-                individual_samples = [jax.tree.map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
+                individual_samples = [jax.tree.map(lambda x: x[i], sample) for i in range(batch_size)]
 
                 # Transform each sample
                 transformed = [self._transform(s) for s in individual_samples]

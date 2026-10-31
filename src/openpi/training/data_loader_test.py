@@ -100,7 +100,7 @@ def test_source_mix_sampler():
     assert len(idx) == 200_000
     assert idx.min() >= 0
     assert idx.max() < 1500
-    frac = lambda a, b: np.mean((idx >= a) & (idx < b))  # noqa: E731
+    frac = lambda a, b: np.mean((idx >= a) & (idx < b))
     assert abs(frac(0, 400) - 0.35) < 0.01
     assert abs(frac(1410, 1500) - 0.30) < 0.01
     assert abs(frac(400, 410) - 0.175) < 0.01  # labs equal
