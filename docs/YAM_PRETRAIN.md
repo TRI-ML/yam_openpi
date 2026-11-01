@@ -55,6 +55,7 @@ Mix: uniform frame sampling over the merged repo = **frame-proportional** (84 % 
 | `pi05_yam_abc_mm2_h32_smoke` | LoRA twin, one 48 GB card | 8 | 200 | repo `local/abc_mm2_smoke_v21` (any assembled subset) |
 | `pi05_yam_abc_mm2_h32_ft` | fine-tune template on a station repo | 32 | 15k | §6 |
 | `pi05_yam_s2_plain` / `pi05_yam_s2_meta` | stage 2 from step 66699 (+ oopsie-YAM, ABC-sim; quality/domain prompt) | 128 | 60k | docs/STAGE2.md |
+| `pi05_yam_s2v2_plain` / `pi05_yam_s2v2_meta` | stage 2 v2: the s2 mix + ABC sim teleop (`absim_teleop`) | 128 | 60k | docs/STAGE2.md "v2" |
 
 Shared: pi05, `action_horizon=32` (1.07 s at 30 Hz = the Cosmos3 WAM chunk; openpi default YAM configs use 10), images 224x224
 resize-with-pad (aspect preserved), prompt = task string, cosine lr 2.5e-5 → 2.5e-6 with 1k warmup, AdamW clip 1.0, EMA 0.99,
