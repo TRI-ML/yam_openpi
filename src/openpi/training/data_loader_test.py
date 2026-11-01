@@ -4,6 +4,7 @@ import jax
 import numpy as np
 import pytest
 
+from openpi import transforms as _transforms
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
@@ -108,3 +109,27 @@ def test_source_mix_sampler():
     assert abs(frac(0, 100) / frac(0, 400) - 0.25) < 0.02  # frame-proportional inside the abc+molmo pool
     with pytest.raises(ValueError, match="not covered"):
         _data_loader.SourceMixSampler(sources, {"abc+molmo": 1.0}, num_samples=1)
+
+
+def test_source_mix_sampler_s2v2():
+    sources = {
+        "molmo": {"first_frame": 0, "end_frame": 100},
+        "abc": {"first_frame": 100, "end_frame": 400},
+        "oopsie_A": {"first_frame": 400, "end_frame": 410},
+        "oopsie_B": {"first_frame": 410, "end_frame": 1410},
+        "absim": {"first_frame": 1410, "end_frame": 1500},
+        "absim_teleop": {"first_frame": 1500, "end_frame": 5000},
+    }
+    mix = _config.get_config("pi05_yam_s2v2_meta").data.base_config.source_mix
+    assert abs(sum(mix.values()) - 1.0) < 1e-9
+    s = _data_loader.SourceMixSampler(sources, mix, num_samples=200_000, seed=0)
+    idx = np.fromiter(iter(s), np.int64)
+
+    def frac(a, b):
+        return np.mean((idx >= a) & (idx < b))
+
+    assert abs(frac(0, 400) - 0.35) < 0.01
+    assert abs(frac(400, 1410) - 0.30) < 0.01
+    assert abs(frac(1410, 1500) - 0.15) < 0.01  # exact key "absim" does not swallow absim_teleop
+    assert abs(frac(1500, 5000) - 0.20) < 0.01
+    assert _transforms.SOURCE_GROUPS[_transforms.source_group("absim_teleop")] == "absim_teleop"
