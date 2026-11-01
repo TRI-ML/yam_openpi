@@ -186,3 +186,98 @@ and also counts the time spent waiting. If the job ends before 60k, relaunch wit
 
 The first plain run (2026-10-30) left only an uncommitted `5000.orbax-checkpoint-tmp-0` (incomplete train_state), so its
 relaunch starts from step 0. That leftover is ignored, and can be deleted with `aws s3 rm --recursive`.
+
+
+## v2: + ABC sim teleop (`pi05_yam_s2v2_plain` / `pi05_yam_s2v2_meta`)
+
+Same as the s2 pair (66699 params + assets, 60k steps, batch 128, lr, prompts, state dropout, FSDP 8) except the repo
+`local/yam_s2v2_train_v21` and the mix 0.35 `abc+molmo` / 0.30 `oopsie_*` / **0.20 `absim_teleop`** / 0.15 `absim` (failures).
+This gives `<quality=success> <domain=sim>` real training data.
+
+New source: `s3://sagemaker-us-west-2-124224456861/zheyuan.hu/data/abc_sim_v3ar/abc_sim_<task>/`, 24 LeRobot **v3.0** task repos,
+54,064 episodes / 44.4M frames / 412 h at 30 fps, 348 GB, robot_type `yam_bimanual_sim`, the same loong schema as abc130k_v3ar
+(`joint_action` / `joint_state` [14] are used; the 20-D EE `action` / `observation.state` are dropped). Cameras
+top/left_wrist/right_wrist are 256x352 AV1 (g=2). Per-frame bool `is_demo` / `is_intervention` columns. Staged on dgx06 at
+`/datasets/aliangdw/stage2/abc_sim_v3ar/<repo>/` (same layout as S3).
+
+| source label | `--repo` label | input | quality | domain |
+|---|---|---|---|---|
+| `absim_teleop` | `absimteleop` | `/datasets/aliangdw/stage2/abc_sim_teleop_v21`: ONE v2.1 dir merging all 24 task repos | 1 (teleop success) | 1 (sim) |
+
+The assembler refuses nothing for this label. It prints the `is_intervention` frame fraction and records it as
+`sources.absim_teleop.intervention_frac` in `meta/assembly.json` (information only). Every source in assembly.json now also has
+`task_episodes` (episodes per task string). The loss telemetry gets a 4th group, `loss/absim_teleop`.
+
+All commands below run on dgx06 from the repo root, with the openpi venv (`PY=.venv/bin/python`). Keep `$HF_LEROBOT_HOME` on
+`/datasets` so videos are hardlinked instead of symlinked. `ffmpeg`/`ffprobe` must be on PATH (or set `FFMPEG` / `FFPROBE`).
+
+**(a) v3.0 → v2.1 (stage-1 path, lossless `ffmpeg -c copy`).** This is the same converter as stage 1, plus `--keep-flags` to keep
+`is_demo` / `is_intervention`. Do not pass the stage-1 molmo options (`--exclude molmo_yam_v3:molmo_val_ids.txt` / `--only`):
+ABC sim has no val holdout. `--skip` is not needed either, since all 24 repos have the 3 cameras. The real stage-1 CLI takes the
+output root positionally; the `--out` / `--exclude-molmo-episodes` spelling in YAM_PRETRAIN.md §1 is shorthand. `convert_source.py`
+parallelises over the v3 data files: there are 7-27 per repo, 305 in total. So run 3 repos at a time, as `sm_entry.sh` does. A
+re-run resumes, because finished episodes leave `ep_*.done`.
+```
+PY=.venv/bin/python; V3=/datasets/aliangdw/stage2/abc_sim_v3ar; ST=/datasets/aliangdw/stage2/abc_sim_teleop_stage
+mkdir -p $ST; ls $V3 | grep ^abc_sim_ | xargs -P 3 -I{} sh -c "$PY yam/pretrain/convert_source.py $V3/{} $ST/{} --workers 48 --keep-flags >> $ST/convert.log 2>&1 || echo {} >> $ST/failed.txt"
+for d in $V3/abc_sim_*; do [ -f $ST/$(basename $d)/source.json ] || echo "MISSING $d"; done     # expect nothing; 24 source.json
+jq -s 'map(.episodes) | add' $ST/abc_sim_*/source.json                                           # 54064
+jq -r '.video_modes | keys[]' $ST/abc_sim_*/source.json | sort | uniq -c                    # expect "copy" only
+$PY yam/pretrain/assemble_v21.py /datasets/aliangdw/stage2/abc_sim_teleop_v21 $ST/abc_sim_* --workers 48 --robot-type yam_bimanual_sim
+```
+The intermediate's `meta/assembly.json` lists each `abc_sim_<task>` with its episode count. Its parquets keep the two flag
+columns, which its info.json does not list, so only the stage-2 assembler should read it, not lerobot.
+
+**(b) Merged stage-2 repo.** Use the exact v1 inputs (from `yam_s2_train_v21/train/meta/assembly.json` `inputs`) plus the new
+label. `--sample abcmolmo=0.10:0` picks the same 16,317 episodes (sha1 `a7de6582…`).
+```
+I=/datasets/aliangdw/stage2; R=$HF_LEROBOT_HOME/local/yam_s2v2_train_v21
+$PY yam/pretrain/assemble_v21.py $R --workers 48 \
+  --repo abcmolmo=$I/abc_molmo_train \
+  --repo oopsie_SE3Labs=$I/oopsie_v21/SE3Labs --repo oopsie_Enact=$I/oopsie_v21/Enact --repo oopsie_AI2_MOLMOACT2=$I/oopsie_v21/AI2_MOLMOACT2 \
+  $(for c in 000 002 014 015 017 020 021 026; do echo --repo oopsie_CMU_Aire=$I/oopsie_v21/CMU_Aire/chunk_$c; done) \
+  --repo absim=$I/absim_v21 --repo absimteleop=$I/abc_sim_teleop_v21 \
+  --sample abcmolmo=0.10:0 --absim-keep failure
+jq -c '.sources | map_values({episodes, frames, intervention_frac})' $R/meta/assembly.json
+jq -r '.dropped["'$I'/abc_molmo_train"]' $R/meta/assembly.json                                  # sha1 a7de6582dac23aa1f88a7863f6f53c39e61a2bb6
+```
+Expected: v1's 31,940 episodes / 75.0M frames (molmo 3,269, abc 13,048, oopsie 1,015 / 329 / 75 / 256, absim 13,948), plus
+absim_teleop 54,064 / ~44.4M. That totals ~86,004 episodes / ~119.4M frames, ~1.23 TB.
+
+**(c) Memmaps.** `$PY yam/pretrain/build_lowdim_memmap.py $R --workers 48`
+
+**(d) Upload + `_COMPLETE`.** Same convention as v1: write the marker last, after checking the upload.
+```
+U=s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2v2_train_v21
+AWS_REGION=us-west-2 s5cmd --numworkers 256 --retry-count 10 cp "$R/*" $U/train/
+find $R -type f -o -type l | wc -l; aws s3 ls --recursive --summarize $U/train/ | tail -2           # same object count, ~1.23 TB
+echo "$(date -u) yam_s2v2_train_v21 86004 eps" | aws s3 cp - $U/_COMPLETE
+```
+
+**(e) SageMaker.** For `CFG=pi05_yam_s2v2*`, `sm_entry.sh` defaults `DATA_CACHE_URI` to `$U` and the repo dir to
+`local/yam_s2v2_train_v21`; it is otherwise the s2 path. The image must be built from a commit that has the s2v2 configs (see
+"Image" above; tag e.g. `s2v2-$(git rev-parse --short HEAD)`). Launch at priority 300 with the same overrides:
+```
+PY=~/Documents/vla_foundry/.venv/bin/python; export AWS_PROFILE=sagemaker
+OV="TRAIN_OVERRIDES=--fsdp-devices 8 --batch-size 128 --num-train-steps 60000 --lr-schedule.decay-steps 60000 --num-workers 32"
+for v in plain meta; do
+  $PY yam/sagemaker/launch_pi05.py --image $IMG --cfg pi05_yam_s2v2_$v --exp pi05_yam_s2v2_${v}_sm_p5 --max-run-days 2 --priority 300 --env "$OV"
+  nohup bash yam/sagemaker/race_watch.sh /tmp/pi05_sm/jobs_pi05_yam_s2v2_${v}_sm_p5.json > /dev/null 2>&1 &
+done
+```
+Every (re)start now fetches ~1.23 TB instead of 883 GB.
+
+**(f) Smoke (200 steps).** Run this after (c), before (d) / (e). It uses dgx06's 8 GPUs on the built repo, so only the 66699 params and assets are fetched:
+```
+export LEROBOT_SKIP_TS_CHECK=1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
+  XLA_FLAGS="--xla_gpu_enable_latency_hiding_scheduler=true --xla_gpu_enable_triton_gemm=true" YAM_ASSEMBLY_JSON=$R/meta/assembly.json
+uv run scripts/train.py pi05_yam_s2v2_meta --exp-name s2v2_smoke --fsdp-devices 8 --overwrite \
+  --num-train-steps 200 --lr-schedule.warmup-steps 20 --save-interval 100 --log-interval 10
+```
+In the log, `source mix (pool -> sample share)` should show abc+molmo 0.35, the 4 oopsie labs 0.075 each, absim_teleop 0.20 and
+absim 0.15. In wandb, expect `loss/{abc,oopsie,absim,absim_teleop}` and `prefix/dropped_frac` ≈ 0.3. The same smoke on SageMaker
+(it fetches the full repo) is `--cfg pi05_yam_s2v2_meta --mode smoke --exp pi05_yam_s2v2_meta_sm_smoke --max-run-days 0.5`, without `--env "$OV"`.
+
+**Conversion time (estimate, not measured).** Stage 1 staged and converted 8 TB in ~100 min on a p5. Here the job is 348 GB, read
+and rewritten on dgx06 NFS (~0.75-1 GB/s aggregate measured for DGX NFS copies), so ≥ 12 min of IO. It also runs ~54k × 6
+ffmpeg/ffprobe processes. Expect ~20-40 min for (a) and a few minutes for the hardlink assembly.
