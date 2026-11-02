@@ -81,7 +81,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming and (ckpt_dir / "wandb_id.txt").exists():
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="allow", project=config.project_name, entity=config.wandb_entity)   # "must" refuses to resume a run that wandb marked crashed
+        wandb.init(id=run_id, name=config.exp_name, resume="allow", project=config.project_name, entity=config.wandb_entity)   # "must" refuses to resume a run that wandb marked crashed
     elif resuming:
         # resumed from a checkpoint mirror that has no wandb id (wandb was disabled, or the id file never synced):
         # start a fresh run rather than crash; the step counter continues from the checkpoint.
