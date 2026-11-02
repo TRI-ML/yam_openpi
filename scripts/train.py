@@ -81,7 +81,8 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name, entity=config.wandb_entity)
+        # "allow": a SageMaker restart gets a new job-derived id, so "must" fails; allow continues the run if it exists and creates it otherwise
+        wandb.init(id=run_id, resume="allow", project=config.project_name, entity=config.wandb_entity)
     else:
         wandb.init(
             name=config.exp_name,
