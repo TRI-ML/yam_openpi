@@ -82,7 +82,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         # "allow": a SageMaker restart gets a new job-derived id, so "must" fails; allow continues the run if it exists and creates it otherwise
-        wandb.init(id=run_id, resume="allow", project=config.project_name, entity=config.wandb_entity)
+        wandb.init(id=run_id, name=config.exp_name, resume="allow", project=config.project_name, entity=config.wandb_entity)
     else:
         wandb.init(
             name=config.exp_name,
