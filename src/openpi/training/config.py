@@ -99,6 +99,9 @@ class DataConfig:
     # Per-sample source mix over the stage-2 `source` labels in <repo>/meta/assembly.json (SourceMixSampler):
     # "a+b" pools sources frame-proportionally, a glob ("oopsie_*") splits its weight equally over the matches.
     source_mix: dict[str, float] | None = None
+    # LeRobot video timestamp tolerance (s). lerobot's 1e-4 kills a run on a stream-copied mp4 that is one frame short of
+    # its parquet (seen on converted ABC sim teleop, ep 60186); 0.05 accepts the nearest frame within ~1.5 frames at 30 fps.
+    video_tolerance_s: float = 0.05
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
