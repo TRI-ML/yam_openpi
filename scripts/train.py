@@ -363,7 +363,8 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             if "data/skipped_samples" in reduced_info:  # mean over the interval -> sum, plus a running total
-                reduced_info["data/skipped_samples"] *= len(infos)
+                # device_get hands back read-only numpy scalars: no in-place ops
+                reduced_info["data/skipped_samples"] = float(reduced_info["data/skipped_samples"]) * len(infos)
                 _skipped_total += reduced_info["data/skipped_samples"]
                 reduced_info["data/skipped_samples_total"] = _skipped_total
             for name in _transforms.SOURCE_GROUPS:
