@@ -2,7 +2,7 @@
 # SageMaker entrypoint: stage Zheyuan's v3ar LeRobot repos -> lossless v2.1 train/val repos -> exact norm stats -> pi05 training
 # with orbax checkpoints in local scratch ($W/checkpoints, never /opt/ml/checkpoints: SageMaker's sync agent raced orbax's writes); a background
 # uploader (ckpt_sync.sh) copies committed steps to CK_URI every 5 min; on (re)start the latest committed step of RESUME_FROM_URI is restored + --resume.
-# Stage 2 (CFG=pi05_yam_s2_* / pi05_yam_s2v2_*, docs/STAGE2.md): fetches the prebuilt merged repo from DATA_CACHE_URI (needs _COMPLETE), no norm stats
+# Stage 2/3 (CFG=pi05_yam_s2_* / pi05_yam_s2v2_* / pi05_yam_s3_*, docs/STAGE2.md): fetches the prebuilt merged repo from DATA_CACHE_URI (needs _COMPLETE), no norm stats
 # (init params + assets are S3 paths in the config), then the same resume/train/publish steps.
 # Env (set by the launcher): CFG EXP MODE(full|smoke) SRC_ROOT DATA_CACHE_URI OUT_URI OPENPI_CACHE_URI WANDB_* TRAIN_OVERRIDES
 #   CK_URI (default $OUT_URI/$EXP/checkpoints_$SM_QUEUE/$CFG/$EXP) RESUME_FROM_URI (default CK_URI) CKPT_SYNC_EVERY (s, 300)
@@ -11,8 +11,8 @@ set -uo pipefail
 [ "${1:-}" = "train" ] && shift
 CFG=${CFG:-pi05_yam_abc_mm2_h32}; EXP=${EXP:-pi05_full_yam_abc_mm2_h32_sm_p5}; MODE=${MODE:-full}
 SRC_ROOT=${SRC_ROOT:-s3://sagemaker-us-west-2-124224456861/zheyuan.hu/data}
-S2=0; case $CFG in pi05_yam_s2*) S2=1;; esac
-S2REPO=yam_s2_train_v21; case $CFG in pi05_yam_s2v2*) S2REPO=yam_s2v2_train_v21;; esac  # v2 = v1 + ABC sim teleop
+S2=0; case $CFG in pi05_yam_s2*|pi05_yam_s3*) S2=1;; esac
+S2REPO=yam_s2_train_v21; case $CFG in pi05_yam_s2v2*|pi05_yam_s3*) S2REPO=yam_s2v2_train_v21;; esac  # v2 = v1 + ABC sim teleop; v3 = v2 repo, stratified
 if [ $S2 = 1 ]; then DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/$S2REPO}
 else DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21}; fi
 OUT_URI=${OUT_URI:-s3://tri-ml-datasets-uw2/tri-yam/train_runs/$CFG}
