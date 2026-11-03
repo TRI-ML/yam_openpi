@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Submit the pi05 YAM pretraining as SageMaker training jobs through the AWS Batch 'vla' service queues (on-demand + spot race).
 Usage: launch_pi05.py --image <ecr uri or digest> [--exp NAME] [--queues vla vla-spot] [--priority 300] [--max-run-days 5] [--mode full|smoke]
-Stage 2: --cfg pi05_yam_s2_plain|pi05_yam_s2_meta --exp <name> [--data-cache-uri s3://.../yam_s2_train_v21] --env TRAIN_OVERRIDES="..."
+Stage 2: --cfg pi05_yam_s2[v2]_plain|pi05_yam_s2[v2]_meta --exp <name> [--data-cache-uri s3://.../yam_s2[v2]_train_v21] --env TRAIN_OVERRIDES="..."
 (sm_entry.sh fetches the prebuilt repo; docs/STAGE2.md "SageMaker"). Priority 300 = OFFICIAL project tier."""
 import argparse
 from datetime import datetime
@@ -25,7 +25,7 @@ def main():
     ap.add_argument("--cfg", default="pi05_yam_abc_mm2_h32"); ap.add_argument("--mode", default="full")
     ap.add_argument("--queues", nargs="+", default=["vla", "vla-spot"]); ap.add_argument("--priority", type=int, default=300)
     ap.add_argument("--max-run-days", type=float, default=5); ap.add_argument("--volume-size", type=int, default=500)
-    ap.add_argument("--data-cache-uri", help="DATA_CACHE_URI for sm_entry.sh (default there: abc_molmo_v21 / yam_s2_train_v21 by cfg)")
+    ap.add_argument("--data-cache-uri", help="DATA_CACHE_URI for sm_entry.sh (default there: abc_molmo_v21 / yam_s2_train_v21 / yam_s2v2_train_v21 by cfg)")
     ap.add_argument("--env", nargs="*", default=[], help="extra KEY=VALUE for the container")
     ap.add_argument("--out", help="jobs json for race_watch.sh (default /tmp/pi05_sm/jobs_<exp>.json)")
     a = ap.parse_args()

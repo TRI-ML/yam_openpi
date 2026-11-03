@@ -357,8 +357,8 @@ class QualityDomainPrefixPrompt(DataTransformFn):
         return {**data, "prompt": prompt, "prefix_dropped": np.int32(dropped)}
 
 
-# Loss/telemetry groups of the stage-2 `source` column (abc|molmo|oopsie_<lab>|absim).
-SOURCE_GROUPS = ("abc", "oopsie", "absim")
+# Loss/telemetry groups of the stage-2 `source` column (abc|molmo|oopsie_<lab>|absim|absim_teleop).
+SOURCE_GROUPS = ("abc", "oopsie", "absim", "absim_teleop")
 
 
 def source_group(source: str) -> int:
@@ -368,6 +368,8 @@ def source_group(source: str) -> int:
         return 1
     if source == "absim":
         return 2
+    if source == "absim_teleop":
+        return 3
     raise ValueError(f"unknown source {source!r}")
 
 

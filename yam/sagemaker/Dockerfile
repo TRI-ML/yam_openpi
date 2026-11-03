@@ -2,7 +2,7 @@
 #   docker build -f yam/sagemaker/Dockerfile -t <ecr>/anthonyliang-openpi:<tag> .
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 UV_LINK_MODE=copy UV_PYTHON=3.11 PATH=/root/.local/bin:/opt/tools:$PATH
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git xz-utils unzip tmux procps jq rsync htop build-essential linux-libc-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git xz-utils unzip tmux procps jq rsync htop build-essential linux-libc-dev libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 # tools: uv, static ffmpeg/ffprobe (libdav1d for AV1), s5cmd, awscli v2
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \

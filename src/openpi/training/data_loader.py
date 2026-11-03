@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import random
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -69,6 +70,46 @@ class TransformedDataset(Dataset[T_co]):
             if k in item:
                 out[k] = item[k]
         return out
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class SkipBadSamples(Dataset[T_co]):
+    """Replaces a sample whose read fails (video decode / timestamp assertion) with a random other index, up to
+    `max_retries` times, then re-raises. Warns once per episode. With `count_key`, every item carries the number of
+    failed reads it replaced (summed by train.py into data/skipped_samples; a per-sample key works across loader workers)."""
+
+    ERRORS = (AssertionError, ValueError, OSError, RuntimeError)
+
+    def __init__(self, dataset: Dataset, max_retries: int = 8, count_key: str | None = None):
+        self._dataset = dataset
+        self._max_retries = max_retries
+        self._count_key = count_key
+        self._warned: set[int] = set()
+
+    def _episode(self, index: int) -> int:
+        edi = getattr(self._dataset, "episode_data_index", None)
+        return int(np.searchsorted(np.asarray(edi["to"]), index, side="right")) if edi is not None else index
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        idx = index.__index__()
+        for failed in range(self._max_retries + 1):
+            try:
+                item = self._dataset[idx]
+            except self.ERRORS as e:
+                if failed == self._max_retries:
+                    raise
+                ep = self._episode(idx)
+                if ep not in self._warned:
+                    self._warned.add(ep)
+                    logging.warning(f"skipping sample {idx} (episode {ep}): {type(e).__name__}: {str(e)[:300]}")
+                idx = random.randrange(len(self._dataset))
+                continue
+            if self._count_key is not None:
+                item = {**item, self._count_key: np.int32(failed)}
+            return item
+        raise AssertionError("unreachable")
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -184,7 +225,7 @@ class YamLeRobotDataset(lerobot_dataset.LeRobotDataset):
 
 
 # Per-sample keys carried next to (Observation, actions) for telemetry: DataLoaderImpl yields them as a third element.
-BATCH_EXTRA_KEYS = ("source_group", "prefix_dropped")
+BATCH_EXTRA_KEYS = ("source_group", "prefix_dropped", "data_skipped")
 
 
 class SourceMixSampler(torch.utils.data.Sampler):
@@ -298,7 +339,10 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        tolerance_s=data_config.video_tolerance_s,
     )
+    # The skip counter rides along only on stage-2 repos (the ones with per-sample extras); others just retry.
+    dataset = SkipBadSamples(dataset, count_key="data_skipped" if "source" in dataset_meta.features else None)
 
     if data_config.prompt_from_task:
         if data_config.meta_prefix_dropout is not None:

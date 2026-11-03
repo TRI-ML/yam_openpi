@@ -99,6 +99,9 @@ class DataConfig:
     # Per-sample source mix over the stage-2 `source` labels in <repo>/meta/assembly.json (SourceMixSampler):
     # "a+b" pools sources frame-proportionally, a glob ("oopsie_*") splits its weight equally over the matches.
     source_mix: dict[str, float] | None = None
+    # LeRobot video timestamp tolerance (s). lerobot's 1e-4 kills a run on a stream-copied mp4 that is one frame short of
+    # its parquet (seen on converted ABC sim teleop, ep 60186); 0.05 accepts the nearest frame within ~1.5 frames at 30 fps.
+    video_tolerance_s: float = 0.05
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -980,7 +983,8 @@ _CONFIGS = [
     ),
     # Stage-2 YAM pretraining (docs/STAGE2.md): pi05_yam_abc_mm2_h32 continued from the 3-node run's step 66699 (params
     # only, fresh optimizer) on ABC+MolmoAct2 + oopsie-YAM (4 labs) + ABC-sim, merged by assemble_v21.py --repo into
-    # local/yam_s2_train_v21, mixed per sample 0.35 / 0.35 (labs equal) / 0.30. The two configs differ ONLY in the prompt.
+    # local/yam_s2_train_v21, mixed per sample 0.40 / 0.35 (labs equal) / 0.25. The two configs differ ONLY in the prompt.
+    # v2 (pi05_yam_s2v2_*): same, plus ABC SIM TELEOP (source absim_teleop) in local/yam_s2v2_train_v21 and the mix below.
     *[
         TrainConfig(
             name=name,
@@ -988,7 +992,7 @@ _CONFIGS = [
             wandb_entity="tri",
             model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
             data=SimpleDataConfig(
-                repo_id="local/yam_s2_train_v21",
+                repo_id=repo_id,
                 # Norm stats the 66699 init was trained with (not recomputed on the mix); YAM_S2_ASSETS_DIR or
                 # --data.assets.assets-dir for a local copy (s3:// is synced with the aws cli).
                 assets=AssetsConfig(
@@ -1020,7 +1024,7 @@ _CONFIGS = [
                     prompt_from_task=True,
                     meta_prefix_dropout=meta_prefix_dropout,
                     state_dropout=0.1,
-                    source_mix={"abc+molmo": 0.40, "oopsie_*": 0.35, "absim": 0.25},  # absim = failures only (2026-10-29)
+                    source_mix=source_mix,
                     action_sequence_keys=("action",),
                 ),
             ),
@@ -1043,7 +1047,16 @@ _CONFIGS = [
             keep_period=20_000,
             max_to_keep=2,
         )
-        for name, meta_prefix_dropout in (("pi05_yam_s2_plain", None), ("pi05_yam_s2_meta", 0.3))
+        for prefix, repo_id, source_mix in (
+            # absim = failures only (2026-10-29)
+            ("pi05_yam_s2", "local/yam_s2_train_v21", {"abc+molmo": 0.40, "oopsie_*": 0.35, "absim": 0.25}),
+            (
+                "pi05_yam_s2v2",
+                "local/yam_s2v2_train_v21",
+                {"abc+molmo": 0.35, "oopsie_*": 0.30, "absim_teleop": 0.20, "absim": 0.15},
+            ),
+        )
+        for name, meta_prefix_dropout in ((f"{prefix}_plain", None), (f"{prefix}_meta", 0.3))
     ],
     # Fine-tune TEMPLATE from a YAM pretrain checkpoint onto one of our station LeRobot v2.1 repos (yam-data materialization,
     # cameras scene/left_wrist/right_wrist as observation.images.<camera>). Point the weight loader at a pretrain `params`

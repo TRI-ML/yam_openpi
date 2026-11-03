@@ -81,7 +81,8 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name, entity=config.wandb_entity)
+        # "allow": a SageMaker restart gets a new job-derived id, so "must" fails; allow continues the run if it exists and creates it otherwise
+        wandb.init(id=run_id, name=config.exp_name, resume="allow", project=config.project_name, entity=config.wandb_entity)
     else:
         wandb.init(
             name=config.exp_name,
@@ -222,6 +223,8 @@ def train_step(
             m = (extras["source_group"] == i).astype(jnp.float32)
             info[f"loss_sum/{name}"] = jnp.sum(per_sample * m)
             info[f"loss_cnt/{name}"] = jnp.sum(m)
+    if "data_skipped" in extras:  # failed sample reads replaced by another index (SkipBadSamples); summed in main()
+        info["data/skipped_samples"] = jnp.sum(extras["data_skipped"]).astype(jnp.float32)
     if "prefix_dropped" in extras:
         info["prefix/dropped_frac"] = jnp.mean(extras["prefix_dropped"].astype(jnp.float32))
     return new_state, info
@@ -345,6 +348,7 @@ def main(config: _config.TrainConfig):
         logging.info(f"dataset composition: {_comp}")
     _t_prev = _time.monotonic()
     _loader_wait = 0.0
+    _skipped_total = 0.0  # since this (re)start
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
@@ -353,6 +357,11 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            if "data/skipped_samples" in reduced_info:  # mean over the interval -> sum, plus a running total
+                # device_get hands back read-only numpy scalars: no in-place ops
+                reduced_info["data/skipped_samples"] = float(reduced_info["data/skipped_samples"]) * len(infos)
+                _skipped_total += reduced_info["data/skipped_samples"]
+                reduced_info["data/skipped_samples_total"] = _skipped_total
             for name in _transforms.SOURCE_GROUPS:
                 if f"loss_sum/{name}" in reduced_info:
                     s, c = reduced_info.pop(f"loss_sum/{name}"), reduced_info.pop(f"loss_cnt/{name}")
