@@ -281,3 +281,34 @@ absim 0.15. In wandb, expect `loss/{abc,oopsie,absim,absim_teleop}` and `prefix/
 **Conversion time (estimate, not measured).** Stage 1 staged and converted 8 TB in ~100 min on a p5. Here the job is 348 GB, read
 and rewritten on dgx06 NFS (~0.75-1 GB/s aggregate measured for DGX NFS copies), so ≥ 12 min of IO. It also runs ~54k × 6
 ffmpeg/ffprobe processes. Expect ~20-40 min for (a) and a few minutes for the hardlink assembly.
+
+## v3: stratified mix + canonical sim prompts + per-field prefix dropout (`pi05_yam_s3_meta`)
+
+Same v2 repo (`local/yam_s2v2_train_v21`, same cache) and warm start; what changes is how it is sampled and prompted.
+Motivation (v2 at 120k): equal lab slots gave AI2 MolmoAct's 75 episodes ~13 epochs while sim teleop saw 0.07, ABC-real loss
+drifted up after 85k, and the sim-failure prompts ("sim pouring beads", "grab the X and place it in the box", "put the A left
+of the B") differed in phrasing from the 24 teleop task names, so `<quality=failure>` was confounded with prompt style.
+
+- **Sampler** `StratifiedMixSampler` (`data_config.strata_mix`): batch share fixed per stratum (domain x quality)
+  `real_success .30 / real_failure .20 / sim_success .30 / sim_failure .20`; inside a stratum each (source, quality) pool is
+  weighted `frames**strata_alpha` (0.5). It reads the per-episode sidecar `meta/episode_strata.jsonl`:
+  ```
+  $PY yam/pretrain/build_episode_strata.py $HF_LEROBOT_HOME/local/yam_s2v2_train_v21 --workers 48      # ~1 min on NFS
+  aws s3 cp $R/meta/episode_strata.jsonl $U/train/meta/episode_strata.jsonl                             # additive; cache otherwise untouched
+  ```
+  Realised shares at 120k x 128 (epochs): abc 16.1% (0.07), molmo 7.2% (0.14), oopsie succ SE3/Enact/CMU ~2% each (0.4-0.5),
+  AI2 succ 0.3% (3.5); oopsie fail CMU 10.3% (0.69), SE3 4.6% (1.5), Enact 3.3% (2.2), AI2 1.9% (3.8); sim teleop 30% (0.10);
+  sim failures 20% (0.13). Failures = 40% of batches.
+- **Prompt remap** `yam/pretrain/absim_prompt_remap.json` (`data_config.prompt_remap_json`): all 1,431 ABC-sim rollout prompts ->
+  8 teleop task names (6 `sim ...` -> their teleop name, `grab the … box` -> `grab clutter`, `put the A <rel> the B` -> `put relative`).
+  Applied in `QualityDomainPrefixPrompt`, the cache's `tasks.jsonl` is not edited.
+- **Dropout** `meta_prefix_field_dropout=True`: quality and domain dropped independently (p=0.3 each) so inference can guide on
+  one axis; telemetry `prefix/quality_dropped_frac`, `prefix/domain_dropped_frac`, `prefix/dropped_frac` (= 1-0.7^2 = 0.51).
+- **Schedule**: one cosine 500 warmup 1e-5 -> 1e-6 over 120k steps, batch 128 (no warm restart). Meta model only.
+
+Smoke (one GPU, real repo): `scripts/train.py pi05_yam_s3_meta --exp-name s3_smoke --fsdp-devices 1 --batch-size 8 --num-train-steps 60
+--lr-schedule.warmup-steps 10 --lr-schedule.decay-steps 60 --save-interval 50 --log-interval 10` and check the log for the strata
+table, "prompt remap … 1431 of 1783 task strings remapped", `prefix/*_frac` ~0.3/0.3/0.51 and a committed checkpoint.
+SageMaker: image `s3-<sha>`, `launch_pi05.py --cfg pi05_yam_s3_meta --exp pi05_yam_s3_meta_sm_p5 --priority 300 --max-run-days 3
+--data-cache-uri s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2v2_train_v21 --env "TRAIN_OVERRIDES=… --num-train-steps 120000
+--lr-schedule.decay-steps 120000 …"`. ~29 h at 0.86 s/step.
