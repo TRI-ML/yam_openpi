@@ -99,6 +99,15 @@ class DataConfig:
     # Per-sample source mix over the stage-2 `source` labels in <repo>/meta/assembly.json (SourceMixSampler):
     # "a+b" pools sources frame-proportionally, a glob ("oopsie_*") splits its weight equally over the matches.
     source_mix: dict[str, float] | None = None
+    # Stage-3 alternative to source_mix (StratifiedMixSampler): batch share per stratum real_success / real_failure /
+    # sim_success / sim_failure; (source, quality) pools inside a stratum weighted frames**strata_alpha. Needs
+    # <repo>/meta/episode_strata.jsonl (yam/pretrain/build_episode_strata.py).
+    strata_mix: dict[str, float] | None = None
+    strata_alpha: float = 0.5
+    # QualityDomainPrefixPrompt: drop quality and domain independently (each with meta_prefix_dropout) instead of as one.
+    meta_prefix_field_dropout: bool = False
+    # JSON {task string: canonical task string} applied before the prefix (yam/pretrain/absim_prompt_remap.json).
+    prompt_remap_json: str | None = None
     # LeRobot video timestamp tolerance (s). lerobot's 1e-4 kills a run on a stream-copied mp4 that is one frame short of
     # its parquet (seen on converted ABC sim teleop, ep 60186); 0.05 accepts the nearest frame within ~1.5 frames at 30 fps.
     video_tolerance_s: float = 0.05
@@ -1058,6 +1067,73 @@ _CONFIGS = [
         )
         for name, meta_prefix_dropout in ((f"{prefix}_plain", None), (f"{prefix}_meta", 0.3))
     ],
+    # v3 (pi05_yam_s3_meta, 2026-11-03): same v2 repo, but (a) StratifiedMixSampler with batch shares fixed per
+    # domain x quality stratum (real_success .30 / real_failure .20 / sim_success .30 / sim_failure .20) and frames**0.5
+    # temperature inside a stratum (v2's equal lab slots gave AI2's 75 episodes 13 epochs while sim teleop got 0.07),
+    # (b) ABC-sim rollout prompts canonicalised to the 24 teleop task names so quality is not confounded with phrasing,
+    # (c) quality / domain prefix dropped independently (p=0.3 each) so inference can guide on one axis, (d) one cosine
+    # over 120k steps (no warm restart). Meta only: plain controls exist at v1/v2.
+    TrainConfig(
+        name="pi05_yam_s3_meta",
+        project_name="openpi",
+        wandb_entity="tri",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=SimpleDataConfig(
+            repo_id="local/yam_s2v2_train_v21",
+            assets=AssetsConfig(
+                assets_dir=os.environ.get(
+                    "YAM_S2_ASSETS_DIR",
+                    "s3://tri-ml-datasets-uw2/tri-yam/train_runs/pi05_yam_abc_mm2_h32/pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66699/assets",
+                ),
+                asset_id="local/abc_mm2_train_v21",
+            ),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.top",
+                                "observation/image_left_wrist": "observation.images.left_wrist",
+                                "observation/image_right_wrist": "observation.images.right_wrist",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                meta_prefix_dropout=0.3,
+                meta_prefix_field_dropout=True,
+                prompt_remap_json=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "yam/pretrain/absim_prompt_remap.json"),
+                state_dropout=0.1,
+                strata_mix={"real_success": 0.30, "real_failure": 0.20, "sim_success": 0.30, "sim_failure": 0.20},
+                strata_alpha=0.5,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "YAM_S2_INIT_PARAMS",
+                "s3://tri-ml-datasets-uw2/tri-yam/train_runs/pi05_yam_abc_mm2_h32/pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66699/params",
+            )
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, weight_decay=1e-4),
+        ema_decay=0.99,
+        log_interval=50,
+        batch_size=128,
+        num_workers=32,
+        fsdp_devices=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=1e-5, decay_steps=120_000, decay_lr=1e-6),
+        num_train_steps=120_000,
+        save_interval=5_000,
+        keep_period=20_000,
+        max_to_keep=2,
+    ),
     # Fine-tune TEMPLATE from a YAM pretrain checkpoint onto one of our station LeRobot v2.1 repos (yam-data materialization,
     # cameras scene/left_wrist/right_wrist as observation.images.<camera>). Point the weight loader at a pretrain `params`
     # dir (env YAM_PRETRAIN_PARAMS, e.g. s3://.../pi05_full_yam_abc_mm2_h32_dgx3node/checkpoints/66700/params downloaded

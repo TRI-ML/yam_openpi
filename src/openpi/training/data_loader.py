@@ -225,7 +225,7 @@ class YamLeRobotDataset(lerobot_dataset.LeRobotDataset):
 
 
 # Per-sample keys carried next to (Observation, actions) for telemetry: DataLoaderImpl yields them as a third element.
-BATCH_EXTRA_KEYS = ("source_group", "prefix_dropped", "data_skipped")
+BATCH_EXTRA_KEYS = ("source_group", "prefix_dropped", "quality_dropped", "domain_dropped", "data_skipped")
 
 
 class SourceMixSampler(torch.utils.data.Sampler):
@@ -300,6 +300,76 @@ class SourceMixSampler(torch.utils.data.Sampler):
             left -= n
 
 
+class StratifiedMixSampler(torch.utils.data.Sampler):
+    """Stage-3 sampler: batch shares fixed per STRATUM (domain x quality), temperature-weighted inside.
+
+    `strata_mix` keys are "real_success" / "real_failure" / "sim_success" / "sim_failure"; inside a stratum every
+    (source, quality) pool gets weight frames**alpha (alpha=0.5 = the usual temperature compromise between equal
+    slots and frame-proportional). Pools come from <repo>/meta/episode_strata.jsonl (yam/pretrain/build_episode_strata.py);
+    frames are drawn uniformly within a pool. Strata with no frames in the repo are dropped with a warning and the rest
+    renormalised (smoke repos). Logs the realised source share and expected epochs for `total_samples` draws."""
+
+    def __init__(self, episodes: list[dict], strata_mix: dict[str, float], num_samples: int, alpha: float = 0.5,
+                 seed: int = 0, total_samples: int | None = None):
+        pools: dict[tuple[str, str], list[tuple[int, int]]] = {}
+        for e in episodes:
+            stratum = f"{'sim' if e['domain'] else 'real'}_{'success' if e['quality'] else 'failure'}"
+            pools.setdefault((stratum, e["source"]), []).append((e["first_frame"], e["first_frame"] + e["length"]))
+        present = {st for st, _ in pools}
+        if unknown := set(strata_mix) - {"real_success", "real_failure", "sim_success", "sim_failure"}:
+            raise ValueError(f"unknown strata {sorted(unknown)}")
+        for st in set(strata_mix) - present:
+            logging.warning(f"stratum {st!r} has no frames in the repo; dropped")
+        if missing := present - set(strata_mix):
+            raise ValueError(f"strata {sorted(missing)} present in the repo but not in strata_mix {strata_mix}")
+        z = sum(w for st, w in strata_mix.items() if st in present)
+        self._starts, self._lens, self._p, self._names, frames = [], [], [], [], []
+        for (st, src), rr in sorted(pools.items()):
+            n = sum(b - a for a, b in rr)
+            within = n**alpha / sum(sum(b - a for a, b in r2) ** alpha for (st2, _), r2 in pools.items() if st2 == st)
+            self._starts.append(np.asarray([a for a, _ in rr], np.int64))
+            self._lens.append(np.asarray([b - a for a, b in rr], np.int64))
+            self._p.append(strata_mix[st] / z * within)
+            self._names.append(f"{st}/{src}")
+            frames.append(n)
+        self._p = np.asarray(self._p, np.float64)
+        self._num_samples, self._seed, self._epoch = num_samples, seed, 0
+        tot = total_samples or num_samples
+        logging.info("strata mix (stratum/source -> share, frames, expected epochs over %d samples):", tot)
+        for name, p, n in zip(self._names, self._p, frames, strict=True):
+            logging.info("  %-32s share=%.4f frames=%d epochs=%.3f", name, p, n, p * tot / n)
+
+    @classmethod
+    def from_repo(cls, repo_id: str, strata_mix: dict[str, float], num_samples: int, alpha: float = 0.5, seed: int = 0,
+                  total_samples: int | None = None) -> "StratifiedMixSampler":
+        root = pathlib.Path(lerobot_dataset.HF_LEROBOT_HOME) / repo_id
+        with open(root / "meta/episode_strata.jsonl") as f:
+            episodes = [json.loads(line) for line in f]
+        return cls(episodes, strata_mix, num_samples, alpha=alpha, seed=seed, total_samples=total_samples)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __iter__(self):
+        rng = np.random.default_rng([self._seed, self._epoch])
+        cums = [np.cumsum(l) - l for l in self._lens]
+        left = self._num_samples
+        while left > 0:
+            n = min(left, 1 << 20)
+            pool = rng.choice(len(self._p), size=n, p=self._p)
+            out = np.empty(n, np.int64)
+            for i in range(len(self._p)):
+                sel = np.flatnonzero(pool == i)
+                u = rng.integers(0, self._lens[i].sum(), size=len(sel))  # uniform over the pool's frames
+                j = np.searchsorted(cums[i], u, side="right") - 1
+                out[sel] = self._starts[i][j] + (u - cums[i][j])
+            yield from out.tolist()
+            left -= n
+
+
 def make_lerobot_dataset(
     repo_id: str, *, delta_timestamps: dict | None = None, **kwargs
 ) -> lerobot_dataset.LeRobotDataset:
@@ -370,7 +440,14 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         if data_config.meta_prefix_dropout is not None:
-            prompt = _transforms.QualityDomainPrefixPrompt(dataset_meta.tasks, dropout_p=data_config.meta_prefix_dropout)
+            remap = None
+            if data_config.prompt_remap_json:
+                with open(data_config.prompt_remap_json) as f:
+                    remap = json.load(f)
+                hit = sum(t in remap for t in dataset_meta.tasks.values())
+                logging.info(f"prompt remap {data_config.prompt_remap_json}: {hit} of {len(dataset_meta.tasks)} task strings remapped")
+            prompt = _transforms.QualityDomainPrefixPrompt(dataset_meta.tasks, dropout_p=data_config.meta_prefix_dropout,
+                                                           field_dropout=data_config.meta_prefix_field_dropout, prompt_remap=remap)
         else:
             prompt = _transforms.PromptFromLeRobotTask(dataset_meta.tasks)
         dataset = TransformedDataset(dataset, [prompt])
@@ -556,7 +633,12 @@ def create_torch_data_loader(
         sampler = make_task_temperature_sampler(
             data_config.repo_id, float(temp), num_samples=len(dataset) // jax.process_count(), seed=seed + jax.process_index()
         )
-    if data_config.source_mix and framework == "jax":
+    if data_config.strata_mix and framework == "jax":
+        sampler = StratifiedMixSampler.from_repo(
+            data_config.repo_id, data_config.strata_mix, num_samples=len(dataset), alpha=data_config.strata_alpha,
+            seed=seed + jax.process_index(), total_samples=(num_batches or 0) * batch_size or None  # batch_size is global here
+        )
+    elif data_config.source_mix and framework == "jax":
         # Replaces the multi-host DistributedSampler too: each process draws its own i.i.d. stream (seed + process id).
         sampler = SourceMixSampler.from_repo(
             data_config.repo_id, data_config.source_mix, num_samples=len(dataset), seed=seed + jax.process_index()

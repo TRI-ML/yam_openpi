@@ -337,24 +337,38 @@ class PromptFromLeRobotTask(DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class QualityDomainPrefixPrompt(DataTransformFn):
     """Stage-2 prompt `<quality=success|failure> <domain=sim|real> <task>` from the `quality` (1 success / 0 failure) and
-    `domain` (0 real / 1 sim) columns written by yam/pretrain/assemble_v21.py --repo, with the whole prefix dropped with
-    probability `dropout_p` (classifier-free-guidance style, so the bare task is learned too). The drop decision is
-    deterministic in (seed, global frame `index`); `prefix_dropped` (0/1) is added for telemetry. Training-only."""
+    `domain` (0 real / 1 sim) columns written by yam/pretrain/assemble_v21.py --repo. Classifier-free-guidance style
+    dropout so the bare task is learned too: with `field_dropout=False` (v1/v2) the whole prefix is dropped with
+    probability `dropout_p`; with `field_dropout=True` (v3) quality and domain are dropped independently, each with
+    `dropout_p`, so inference can guide on one axis alone. Drop decisions are deterministic in (seed, global frame
+    `index`). `prompt_remap` canonicalises task strings first (v3: ABC-sim rollout prompts -> the teleop task names, so
+    the quality token is not confounded with prompt phrasing). Telemetry: `prefix_dropped` (anything dropped),
+    `quality_dropped`, `domain_dropped` (0/1). Training-only."""
 
     tasks: dict[int, str]
     dropout_p: float = 0.3
     seed: int = 0
+    field_dropout: bool = False
+    prompt_remap: dict[str, str] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         task = self.tasks[int(data["task_index"])]
-        dropped = bool(np.random.default_rng([self.seed, int(data["index"])]).random() < self.dropout_p)
-        if dropped:
-            prompt = task
+        if self.prompt_remap:
+            task = self.prompt_remap.get(task, task)
+        idx = int(data["index"])
+        if self.field_dropout:
+            drop_q = bool(np.random.default_rng([self.seed, idx, 1]).random() < self.dropout_p)
+            drop_d = bool(np.random.default_rng([self.seed, idx, 2]).random() < self.dropout_p)
         else:
-            quality = "success" if int(data["quality"]) == 1 else "failure"
-            domain = "sim" if int(data["domain"]) == 1 else "real"
-            prompt = f"<quality={quality}> <domain={domain}> {task}"
-        return {**data, "prompt": prompt, "prefix_dropped": np.int32(dropped)}
+            drop_q = drop_d = bool(np.random.default_rng([self.seed, idx]).random() < self.dropout_p)
+        parts = []
+        if not drop_q:
+            parts.append(f"<quality={'success' if int(data['quality']) == 1 else 'failure'}>")
+        if not drop_d:
+            parts.append(f"<domain={'sim' if int(data['domain']) == 1 else 'real'}>")
+        parts.append(task)
+        return {**data, "prompt": " ".join(parts), "prefix_dropped": np.int32(drop_q or drop_d),
+                "quality_dropped": np.int32(drop_q), "domain_dropped": np.int32(drop_d)}
 
 
 # Loss/telemetry groups of the stage-2 `source` column (abc|molmo|oopsie_<lab>|absim|absim_teleop).

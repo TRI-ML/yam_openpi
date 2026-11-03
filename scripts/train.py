@@ -230,8 +230,9 @@ def train_step(
             info[f"loss_cnt/{name}"] = jnp.sum(m)
     if "data_skipped" in extras:  # failed sample reads replaced by another index (SkipBadSamples); summed in main()
         info["data/skipped_samples"] = jnp.sum(extras["data_skipped"]).astype(jnp.float32)
-    if "prefix_dropped" in extras:
-        info["prefix/dropped_frac"] = jnp.mean(extras["prefix_dropped"].astype(jnp.float32))
+    for k in ("prefix_dropped", "quality_dropped", "domain_dropped"):
+        if k in extras:
+            info[f"prefix/{k.replace('prefix_', '')}_frac"] = jnp.mean(extras[k].astype(jnp.float32))
     return new_state, info
 
 
