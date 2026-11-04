@@ -566,6 +566,7 @@ def create_data_loader(
         model_config=config.model,
         action_horizon=config.model.action_horizon,
         batch_size=config.batch_size,
+        total_samples=config.num_train_steps * config.batch_size,
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
@@ -589,8 +590,10 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    total_samples: int | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a data loader for training.
+    """Create a data loader for training. `total_samples` (= train steps x global batch) is only used by the stratified
+    sampler's expected-epochs log line.
 
     Args:
         data_config: The data configuration.
@@ -636,7 +639,7 @@ def create_torch_data_loader(
     if data_config.strata_mix and framework == "jax":
         sampler = StratifiedMixSampler.from_repo(
             data_config.repo_id, data_config.strata_mix, num_samples=len(dataset), alpha=data_config.strata_alpha,
-            seed=seed + jax.process_index(), total_samples=(num_batches or 0) * batch_size or None  # batch_size is global here
+            seed=seed + jax.process_index(), total_samples=total_samples
         )
     elif data_config.source_mix and framework == "jax":
         # Replaces the multi-host DistributedSampler too: each process draws its own i.i.d. stream (seed + process id).
