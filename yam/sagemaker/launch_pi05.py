@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--cfg", default="pi05_yam_abc_mm2_h32"); ap.add_argument("--mode", default="full")
     ap.add_argument("--queues", nargs="+", default=["vla", "vla-spot"]); ap.add_argument("--priority", type=int, default=300)
     ap.add_argument("--max-run-days", type=float, default=5); ap.add_argument("--volume-size", type=int, default=500)
+    ap.add_argument("--instance-count", type=int, default=1, help="p5 instances; >1 = one JAX process per instance, local-ckpt layout (sm_entry.sh)")
     ap.add_argument("--data-cache-uri", help="DATA_CACHE_URI for sm_entry.sh (default there: abc_molmo_v21 / yam_s2_train_v21 by cfg)")
     ap.add_argument("--env", nargs="*", default=[], help="extra KEY=VALUE for the container")
     ap.add_argument("--out", help="jobs json for race_watch.sh (default /tmp/pi05_sm/jobs_<exp>.json)")
@@ -49,7 +50,7 @@ def main():
         ckpt_uri = f"s3://tri-ml-datasets-uw2/tri-yam/train_runs/{a.cfg}/{a.exp}/checkpoints_{qkey}/{a.cfg}/{a.exp}"
         # reserved-capacity (on-demand) queues require SM_USE_RESERVED_CAPACITY=1; spot/training-plan queues want 0 (same rule as vla_foundry)
         env = dict(base_env, SM_QUEUE=qkey, CK_URI=ckpt_uri, SM_USE_RESERVED_CAPACITY=("0" if spot else "1"))
-        est = Estimator(image_uri=a.image, role=ROLE, instance_count=1, instance_type="ml.p5.48xlarge", sagemaker_session=sess,
+        est = Estimator(image_uri=a.image, role=ROLE, instance_count=a.instance_count, instance_type="ml.p5.48xlarge", sagemaker_session=sess,
                         volume_size=a.volume_size, max_run=max_run, max_wait=max_run if spot else None, use_spot_instances=spot,
                         environment=env,
                         output_path=f"s3://tri-ml-datasets-uw2/tri-yam/train_runs/{a.cfg}/{a.exp}/sm_output_{qkey}",
