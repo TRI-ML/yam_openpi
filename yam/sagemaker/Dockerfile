@@ -1,4 +1,4 @@
-# yam_openpi (TRI-ML/yam_openpi) SageMaker training image for pi05 YAM pretraining (ABC-130k + MolmoAct2). Build from the repo root:
+# yam_openpi (TRI-ML/yam_openpi) SageMaker training image for pi05 YAM pretraining (ABC-130k + MolmoAct2) and stage 2 (docs/STAGE2.md). Build from the repo root:
 #   docker build -f yam/sagemaker/Dockerfile -t <ecr>/anthonyliang-openpi:<tag> .
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 UV_LINK_MODE=copy UV_PYTHON=3.11 PATH=/root/.local/bin:/opt/tools:$PATH
@@ -16,7 +16,7 @@ COPY . /opt/ml/code/yam_openpi
 WORKDIR /opt/ml/code/yam_openpi
 RUN uv python install 3.11 && GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-dev && rm -rf /root/.cache/uv && .venv/bin/python -c "import etils, orbax, jax, lerobot; print('venv ok', jax.__version__)"
 # sanity: configs import, pyav has dav1d, ffmpeg present
-RUN .venv/bin/python -c "import sys; sys.path.insert(0,'src'); from openpi.training import config as C; C.get_config('pi05_yam_abc_mm2_h32'); C.get_config('pi05_yam_abc_mm2_h32_smoke'); print('configs ok')" \
+RUN .venv/bin/python -c "import sys; sys.path.insert(0,'src'); from openpi.training import config as C; C.get_config('pi05_yam_abc_mm2_h32'); C.get_config('pi05_yam_abc_mm2_h32_smoke'); C.get_config('pi05_yam_s2_plain'); C.get_config('pi05_yam_s2_meta'); print('configs ok')" \
     && .venv/bin/python -c "import av, jax; print('pyav', av.__version__, 'dav1d' if any('dav1d' in c for c in av.codecs_available) else 'NO-DAV1D')" \
     && ffmpeg -hide_banner -version | head -1 && chmod +x yam/sagemaker/*.sh yam/pretrain/*.sh yam/multihost/*.sh
 ENV PYTHONUNBUFFERED=1 SAGEMAKER_PROGRAM=/opt/ml/code/yam_openpi/yam/sagemaker/sm_entry.sh

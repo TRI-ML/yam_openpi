@@ -335,6 +335,65 @@ class PromptFromLeRobotTask(DataTransformFn):
         return {**data, "prompt": prompt}
 
 @dataclasses.dataclass(frozen=True)
+class QualityDomainPrefixPrompt(DataTransformFn):
+    """Stage-2 prompt `<quality=success|failure> <domain=sim|real> <task>` from the `quality` (1 success / 0 failure) and
+    `domain` (0 real / 1 sim) columns written by yam/pretrain/assemble_v21.py --repo, with the whole prefix dropped with
+    probability `dropout_p` (classifier-free-guidance style, so the bare task is learned too). The drop decision is
+    deterministic in (seed, global frame `index`); `prefix_dropped` (0/1) is added for telemetry. Training-only."""
+
+    tasks: dict[int, str]
+    dropout_p: float = 0.3
+    seed: int = 0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        task = self.tasks[int(data["task_index"])]
+        dropped = bool(np.random.default_rng([self.seed, int(data["index"])]).random() < self.dropout_p)
+        if dropped:
+            prompt = task
+        else:
+            quality = "success" if int(data["quality"]) == 1 else "failure"
+            domain = "sim" if int(data["domain"]) == 1 else "real"
+            prompt = f"<quality={quality}> <domain={domain}> {task}"
+        return {**data, "prompt": prompt, "prefix_dropped": np.int32(dropped)}
+
+
+# Loss/telemetry groups of the stage-2 `source` column (abc|molmo|oopsie_<lab>|absim).
+SOURCE_GROUPS = ("abc", "oopsie", "absim")
+
+
+def source_group(source: str) -> int:
+    if source in ("abc", "molmo"):
+        return 0
+    if source.startswith("oopsie_"):
+        return 1
+    if source == "absim":
+        return 2
+    raise ValueError(f"unknown source {source!r}")
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceGroupFromColumn(DataTransformFn):
+    """Adds `source_group` (index into SOURCE_GROUPS) from the stage-2 `source` column for per-source loss."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        return {**data, "source_group": np.int32(source_group(str(data["source"])))}
+
+
+@dataclasses.dataclass(frozen=True)
+class StateDropout(DataTransformFn):
+    """Zeroes the (normalized) state with probability `p` per sample. Applied right after Normalize so a dropped state
+    equals the zero padding / the normalized mean region, not an out-of-range raw value. Training-only."""
+
+    p: float = 0.1
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # Unseeded: workers are spawned processes, each with fresh numpy entropy.
+        if self.p > 0 and np.random.random() < self.p:
+            data = {**data, "state": np.zeros_like(data["state"])}
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

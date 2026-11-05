@@ -119,3 +119,28 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_quality_domain_prefix_prompt():
+    tasks = {0: "fold the towel"}
+    t = _transforms.QualityDomainPrefixPrompt(tasks, dropout_p=0.0)
+    out = t({"task_index": 0, "index": 7, "quality": 0, "domain": 1})
+    assert out["prompt"] == "<quality=failure> <domain=sim> fold the towel"
+    assert out["prefix_dropped"] == 0
+    out = t({"task_index": 0, "index": 7, "quality": 1, "domain": 0})
+    assert out["prompt"] == "<quality=success> <domain=real> fold the towel"
+
+    t = _transforms.QualityDomainPrefixPrompt(tasks, dropout_p=0.3, seed=1)
+    outs = [t({"task_index": 0, "index": i, "quality": 1, "domain": 0}) for i in range(4000)]
+    dropped = np.array([o["prefix_dropped"] for o in outs])
+    assert 0.27 < dropped.mean() < 0.33
+    assert all(o["prompt"] == "fold the towel" for o, d in zip(outs, dropped, strict=True) if d)
+    # deterministic per (seed, index)
+    again = [t({"task_index": 0, "index": i, "quality": 1, "domain": 0})["prefix_dropped"] for i in range(4000)]
+    assert np.array_equal(dropped, again)
+
+
+def test_state_dropout():
+    t = _transforms.StateDropout(0.1)
+    zeroed = [not t({"state": np.ones(14)})["state"].any() for _ in range(5000)]
+    assert 0.08 < np.mean(zeroed) < 0.12

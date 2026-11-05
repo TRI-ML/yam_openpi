@@ -1,41 +1,49 @@
 #!/bin/bash
-# Checkpoint syncer: mirror FINISHED orbax steps from a local checkpoint dir to S3 (or a local dir, for tests).
-# Why: SageMaker's /opt/ml/checkpoints sync agent drops zero-byte `<file>.sagemaker-uploaded` markers inside orbax's
-# in-progress `*.orbax-checkpoint-tmp-*` dirs; orbax json-decodes every file under array_metadatas/ and dies
-# (JSONDecodeError) at finalize. So training writes to a scratch dir and THIS script is the only thing that touches S3.
-# A step is finished when its dir name is all digits (orbax renames the tmp dir atomically at finalize) AND
-# `_CHECKPOINT_METADATA` exists AND no `*.orbax-checkpoint-tmp-*` remains inside. Markers are excluded defensively.
-# Usage: ckpt_sync.sh <local ckpt dir (…/<cfg>/<exp>)> <dest (s3://… or /path)> [--once] [--interval 60]
-set -uo pipefail
-SRC=${1:?local ckpt dir}; DST=${2:?dest}; shift 2; ONCE=0; INTERVAL=60
-while [ $# -gt 0 ]; do case $1 in --once) ONCE=1;; --interval) INTERVAL=$2; shift;; esac; shift; done
-S5="s5cmd --numworkers ${S5_WORKERS:-128} --retry-count 10"
-log(){ echo "$(date -u +%FT%TZ) [ckpt_sync] $*"; }
-copy_dir(){ # $1 local dir, $2 dest prefix (no trailing slash)
-  if [[ "$2" == s3://* ]]; then $S5 sync --exclude "*.sagemaker-uploaded" --exclude ".synced" "$1/" "$2/" >/dev/null
-  else mkdir -p "$2" && rsync -a --exclude "*.sagemaker-uploaded" --exclude ".synced" "$1/" "$2/"; fi
-}
-put_file(){ if [[ "$2" == s3://* ]]; then $S5 cp "$1" "$2" >/dev/null; else mkdir -p "$(dirname "$2")" && cp "$1" "$2"; fi; }
-exists(){ if [[ "$1" == s3://* ]]; then $S5 ls "$1" >/dev/null 2>&1; else [ -e "$1" ]; fi; }
-finished(){ # $1 = step dir
-  local d=$1; [[ "$(basename "$d")" =~ ^[0-9]+$ ]] || return 1
-  [ -f "$d/_CHECKPOINT_METADATA" ] || return 1
-  [ -z "$(find "$d" -maxdepth 2 -name '*.orbax-checkpoint-tmp-*' -print -quit 2>/dev/null)" ] || return 1
-  return 0
-}
-pass(){
-  [ -d "$SRC" ] || return 0
-  [ -f "$SRC/wandb_id.txt" ] && ! exists "$DST/wandb_id.txt" && put_file "$SRC/wandb_id.txt" "$DST/wandb_id.txt" && log "synced wandb_id.txt"
-  for d in $(ls -d "$SRC"/[0-9]* 2>/dev/null | sort -V); do
-    local st; st=$(basename "$d"); [ -f "$SRC/.synced/$st" ] && continue; finished "$d" || continue
-    log "syncing step $st -> $DST/$st/"; local t0=$(date +%s)
-    if copy_dir "$d" "$DST/$st"; then
-      # the sentinel is written LAST and lives OUTSIDE the orbax step dir ($SRC/.synced/<step>): writing it inside the
-      # step dir raced orbax's pruning of the previous step (OSError: Directory not empty) at the end of training.
-      mkdir -p "$SRC/.synced" && echo "$(date -u +%FT%TZ) $(du -sb "$d" | cut -f1)" > "$SRC/.synced/$st" && put_file "$SRC/.synced/$st" "$DST/$st/.complete"
-      log "step $st synced in $(( $(date +%s)-t0 ))s"
-    else log "WARN sync of step $st failed (retry next pass)"; rm -f "$SRC/.synced/$st"; fi
+# Checkpoint upload / resume for SageMaker, sourced by sm_entry.sh (tested by test_ckpt_sync.sh). train.py writes orbax checkpoints to a
+# local scratch dir; only COMMITTED steps leave it, so nothing ever sees orbax's in-progress files (the /opt/ml/checkpoints sync race).
+#   local step committed  = name is all digits (orbax renamed it from <step>.orbax-checkpoint-tmp-*) and has _CHECKPOINT_METADATA
+#   remote step committed = has _UPLOADED (written after every other file of the step); with CKPT_HOSTS=N > 1 (SageMaker
+#   multi-instance, OPENPI_LOCAL_CKPT layout: every host uploads ITS shards of the same step to the same prefix) each host
+#   writes _UPLOADED.<CKPT_RANK> and the step is committed once all N markers exist. Only rank 0 prunes.
+# Remote roots are s3:// prefixes (s5cmd/aws) or, in the test, local dirs. Needs S5 (s5cmd command) for s3.
+KEEP_PERIOD=${KEEP_PERIOD:-20000}; KEEP_LAST=${KEEP_LAST:-2}; CKPT_HOSTS=${CKPT_HOSTS:-1}; CKPT_RANK=${CKPT_RANK:-0}
+_marker(){ [ "$CKPT_HOSTS" -gt 1 ] && echo "_UPLOADED.$CKPT_RANK" || echo "_UPLOADED"; }
+_committed(){ # $1 = remote root, $2 = step: all hosts' markers present
+  if [ "$CKPT_HOSTS" -gt 1 ]; then local n; if _s3 $1; then n=$(aws s3 ls "$1/$2/" 2>/dev/null | grep -c '_UPLOADED\.'); else n=$(ls "$1/$2" 2>/dev/null | grep -c '_UPLOADED\.'); fi; [ "$n" -ge "$CKPT_HOSTS" ]
+  else if _s3 $1; then aws s3 ls "$1/$2/_UPLOADED" >/dev/null 2>&1; else [ -f "$1/$2/_UPLOADED" ]; fi; fi; }
+_s3(){ [[ $1 == s3://* ]]; }
+_log(){ echo "$(date -u +%FT%TZ) [ckpt_sync] $*"; }
+local_steps(){ for d in "$1"/*/; do s=$(basename "$d"); [[ $s =~ ^[0-9]+$ ]] && [ -f "$d/_CHECKPOINT_METADATA" ] && echo $s; done | sort -n; }
+remote_all(){ if _s3 $1; then aws s3 ls "$1/" 2>/dev/null | awk '$1=="PRE"{sub("/$","",$2); print $2}'; else ls "$1" 2>/dev/null; fi | grep -E '^[0-9]+$' | sort -n; }
+remote_steps(){ for s in $(remote_all "$1"); do _committed "$1" $s && echo $s; done; }
+put_file(){ if _s3 $2; then $S5 cp "$1" "$2" >/dev/null; else mkdir -p "$(dirname "$2")" && cp "$1" "$2"; fi; }
+get_file(){ if _s3 $1; then $S5 cp "$1" "$2" >/dev/null; else cp "$1" "$2"; fi; }
+put_step(){ # $1 = local step dir, $2 = remote root -> $2/<step>/ (+ marker last)
+  local s m; s=$(basename "$1"); m=$(_marker)
+  if _s3 $2; then $S5 cp "$1/*" "$2/$s/" >/dev/null && date -u | $S5 pipe "$2/$s/$m" >/dev/null
+  else mkdir -p "$2/$s" && cp -r "$1/." "$2/$s/" && date -u > "$2/$s/$m"; fi; }
+get_step(){ mkdir -p "$3/$2"; if _s3 $1; then $S5 cp "$1/$2/*" "$3/$2/" >/dev/null; else cp -r "$1/$2/." "$3/$2/"; fi && rm -f "$3/$2"/_UPLOADED*; }
+rm_step(){ if _s3 $1; then $S5 rm "$1/$2/*" >/dev/null; else rm -rf "${1:?}/$2"; fi; }
+
+sync_pass(){ # $1 = local root, $2 = remote root: upload new committed steps + wandb_id.txt, then prune the remote to the keep policy
+  local L=$1 R=$2 have s m; m=$(_marker)
+  have=" $(for s in $(remote_all $R); do if _s3 $R; then aws s3 ls "$R/$s/$m" >/dev/null 2>&1; else [ -f "$R/$s/$m" ]; fi && echo $s; done | tr '\n' ' ') "
+  [ -f $L/wandb_id.txt ] && put_file $L/wandb_id.txt $R/wandb_id.txt
+  for s in $(local_steps $L); do
+    [[ $have == *" $s "* ]] && continue
+    _log "upload $s -> $R/$s/"; put_step $L/$s $R && have="$have$s " || _log "WARN upload $s failed (retried next pass)"
   done
-}
-if [ $ONCE = 1 ]; then pass; exit 0; fi
-while true; do pass; [ -f "$SRC/.stop_sync" ] && { pass; log "stop requested; final pass done"; exit 0; }; sleep "$INTERVAL"; done
+  [ "$CKPT_RANK" = 0 ] || return 0   # one pruner
+  local done_ last keep; done_=" $(remote_steps $R | tr '\n' ' ') "; last=$(echo $done_ | awk '{print $NF}')
+  keep=" $(echo $done_ | tr ' ' '\n' | tail -n $KEEP_LAST | tr '\n' ' ') "
+  for s in $(remote_all $R); do
+    [[ $keep == *" $s "* ]] && continue
+    if [[ $done_ == *" $s "* ]]; then [ $((s % KEEP_PERIOD)) -eq 0 ] && continue   # committed period multiple
+    elif [ -z "$last" ] || [ "$s" -gt "$last" ]; then continue; fi                   # partial upload newer than the last commit: retried
+    _log "prune $R/$s"; rm_step $R $s
+  done; }
+
+resume_latest(){ # $1 = remote root, $2 = local root. 0 + echo step: restored. 1: nothing committed remotely. 2: restore failed (do not start fresh)
+  local s; s=$(remote_steps $1 | tail -1); [ -n "$s" ] || return 1
+  get_step $1 $s $2 && get_file $1/wandb_id.txt $2/wandb_id.txt && [ -f $2/$s/_CHECKPOINT_METADATA ] || return 2
+  echo $s; }

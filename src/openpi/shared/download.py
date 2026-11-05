@@ -89,6 +89,9 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
                 # All other gs:// URLs (e.g. big_vision) continue to use gcsfs as normal.
                 if parsed.scheme == "gs" and parsed.netloc == "openpi-assets":
                     _download_gsutil(url, scratch_path, **kwargs)
+                elif parsed.scheme == "s3" and shutil.which("aws") is not None:
+                    # s3fs is not installed in this env; the aws cli is. shortcut: directory (prefix) URLs only.
+                    subprocess.run(["aws", "s3", "sync", "--only-show-errors", url, str(scratch_path)], check=True)
                 else:
                     _download_fsspec(url, scratch_path, **kwargs)
 

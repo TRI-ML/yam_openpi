@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import functools
 import logging
+import os
 from typing import Protocol
 
 from etils import epath
@@ -18,13 +20,24 @@ import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
+    max_to_keep: int = 1,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
-    # Multi-host: the checkpoint dir MUST be on a filesystem shared by all processes (orbax writes per-process shards
-    # into it). Only process 0 wipes/creates it; everyone else waits at a barrier, then reads the same directory.
-    if jax.process_index() == 0:
+    # Multi-host, two layouts:
+    #  shared (default): the dir is on a filesystem shared by all processes (DGX NFS); only process 0 wipes/creates it,
+    #    everyone else waits at a barrier, then reads the same directory.
+    #  local (OPENPI_LOCAL_CKPT=1, SageMaker multi-instance, no shared FS): every process is its own orbax primary and
+    #    writes ITS shards + identical metadata into its own local dir (plain zarr, no OCDBT); the union of the per-host
+    #    dirs (all hosts upload to one S3 prefix, see yam/sagemaker/ckpt_sync.sh) is a complete checkpoint, and each host
+    #    restores from that union.
+    local_ckpt = os.environ.get("OPENPI_LOCAL_CKPT", "0") == "1"
+    if jax.process_index() == 0 or local_ckpt:
         if checkpoint_dir.exists():
             if overwrite:
                 checkpoint_dir.rmtree()
@@ -38,7 +51,7 @@ def initialize_checkpoint_dir(
                     "to indicate how to handle it."
                 )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if jax.process_count() > 1:
+    if jax.process_count() > 1 and not local_ckpt:
         import time as _time
 
         from jax.experimental import multihost_utils
@@ -61,17 +74,26 @@ def initialize_checkpoint_dir(
         )
         multihost_utils.sync_global_devices("openpi_ckpt_dir_visible")
 
+    # local layout: plain zarr (one chunk file per shard, distinct names across hosts) so per-host dirs union cleanly;
+    # OCDBT would give every host its own manifest.ocdbt and the union would keep only one.
+    mp_opts = ocp.options.MultiprocessingOptions(primary_host=None) if local_ckpt else None
+    tree_handler = functools.partial(
+        ocp.PyTreeCheckpointHandler, use_ocdbt=not local_ckpt, use_zarr3=not local_ckpt, multiprocessing_options=mp_opts
+    )
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
             "assets": CallbackHandler(),
-            "train_state": ocp.PyTreeCheckpointHandler(),
-            "params": ocp.PyTreeCheckpointHandler(),
+            "train_state": tree_handler(),
+            "params": tree_handler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            max_to_keep=max_to_keep,
             keep_period=keep_period,
             create=False,
+            multiprocessing_options=mp_opts,
+            # OPENPI_ASYNC_CKPT=0 (SageMaker) = synchronous saves: the step dir is committed when save() returns.
+            enable_async_checkpointing=os.environ.get("OPENPI_ASYNC_CKPT", "1") != "0",
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )
