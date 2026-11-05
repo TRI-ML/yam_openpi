@@ -9,7 +9,7 @@ package keeps the upstream name `openpi`. Everything below this section is the u
 **Language augmentation (training only).** `yam/config/language_annotations.yaml` holds, per station task, the recorded
 `original` prompt(s) and 5 Astra-grounded `randomized` paraphrases (LBM format). Set `YAM_LANG_AUG_P=0.5` on any
 `pi05_yam_*` training run and `YAMInputs` swaps each sample's recorded prompt for a random paraphrase of the same task
-with that probability (unknown prompts, e.g. ABC/MolmoAct2 rows, pass through unchanged). Unset / 0 = off, which is the
+with that probability (unknown prompts, e.g. ABC/MolmoAct2 rows, pass through unchanged). `YAM_LANG_AUG_MODE=uniform` instead draws every sample's prompt uniformly from ALL of the task's strings (originals + paraphrases; `YAM_LANG_AUG_P` is then ignored) — the recommended setting for pretraining / mid-training. Unset / 0 = off, which is the
 default, so serving and eval are unaffected: evaluate with the `original` prompt, and the deploy sidecars keep
 `tasks[].prompt` = original. `YAM_LANG_ANNOTATIONS=<path>` points at a different yaml. The yaml ships in the SageMaker
 image (`COPY .`), so a run needs an image built from a commit that contains both this transform and the yaml.

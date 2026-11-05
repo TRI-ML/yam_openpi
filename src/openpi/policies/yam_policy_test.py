@@ -26,7 +26,7 @@ def test_off_by_default(aug):
 
 def test_always_paraphrases_from_the_right_task(aug):
     aug(1)
-    _, mapping = yam_policy._lang_aug()
+    _, _, mapping = yam_policy._lang_aug()
     assert len(mapping) >= 11  # 9 tasks, SortUtensils has 3 recorded variants
     alts = set(mapping[yam_policy._norm_prompt(RECORDED)])
     assert len(alts) == 5
@@ -54,3 +54,13 @@ def test_inputs_transform_applies(aug):
     ex["prompt"] = RECORDED
     out = yam_policy.YAMInputs()(ex)
     assert out["prompt"] != RECORDED
+
+
+def test_uniform_mode_samples_every_string(aug, monkeypatch):
+    monkeypatch.setenv("YAM_LANG_AUG_MODE", "uniform")
+    aug(0)  # p is ignored in uniform mode; aug() clears the cache
+    original = "Place the teabag into the teapot"
+    seen = {str(yam_policy.augment_prompt(original)) for _ in range(400)}
+    assert original in seen, "uniform mode must also sample the recorded prompt"
+    assert len(seen) == 6, seen  # 1 original + 5 randomized
+    assert all("table" not in s for s in seen)

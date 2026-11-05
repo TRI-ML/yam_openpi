@@ -46,31 +46,51 @@ def _norm_prompt(text: str) -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def _lang_aug() -> tuple[float, dict[str, list[str]]]:
-    """Language augmentation from env: YAM_LANG_AUG_P (unset/0 = off) and YAM_LANG_ANNOTATIONS (LBM-format yaml).
-    Returns (p, {normalized recorded prompt -> randomized paraphrases}); every `original` of a task maps to its list."""
+def _lang_aug() -> tuple[str, float, dict[str, list[str]]]:
+    """Language augmentation from env. YAM_LANG_AUG_MODE selects the scheme (default "swap"):
+      swap:    with probability YAM_LANG_AUG_P (unset/0 = off) replace the recorded prompt by one of its `randomized` paraphrases
+      uniform: always draw uniformly from ALL strings of the task (every `original` + every `randomized`), YAM_LANG_AUG_P ignored
+    YAM_LANG_ANNOTATIONS points at the LBM-format yaml. Returns (mode, p, {normalized recorded prompt -> candidate strings});
+    every `original` of a task maps to the same list."""
+    mode = os.environ.get("YAM_LANG_AUG_MODE", "swap").strip().lower()
     p = float(os.environ.get("YAM_LANG_AUG_P", "0") or 0)
+    if mode == "uniform":
+        p = 1.0
+    if mode not in ("swap", "uniform"):
+        raise ValueError(f"YAM_LANG_AUG_MODE must be swap or uniform, got {mode!r}")
     if p <= 0:
-        return 0.0, {}
+        return mode, 0.0, {}
     path = pathlib.Path(os.environ.get("YAM_LANG_ANNOTATIONS", _DEFAULT_ANNOTATIONS))
     with open(path) as f:
         tasks = yaml.safe_load(f)["language_dict"]
-    mapping = {
-        _norm_prompt(o): list(t["randomized"]) for t in tasks.values() for o in t["original"] if t.get("randomized")
-    }
-    logging.info("YAM language augmentation: p=%.2f, %d recorded prompts -> paraphrases from %s", p, len(mapping), path)
-    return p, mapping
+    mapping = {}
+    for t in tasks.values():
+        originals = list(t.get("original", []))
+        randomized = list(t.get("randomized", []))
+        pool = list(dict.fromkeys(originals + randomized)) if mode == "uniform" else randomized
+        if not pool:
+            continue
+        for o in originals:
+            mapping[_norm_prompt(o)] = pool
+    logging.info(
+        "YAM language augmentation: mode=%s p=%.2f, %d recorded prompts -> candidates from %s",
+        mode,
+        p,
+        len(mapping),
+        path,
+    )
+    return mode, p, mapping
 
 
 def augment_prompt(prompt):
-    """With probability YAM_LANG_AUG_P, swap a recorded prompt for one of its paraphrases. Unknown prompts pass through."""
-    p, mapping = _lang_aug()
+    """Training-time prompt augmentation (see _lang_aug). Unknown prompts pass through unchanged."""
+    mode, p, mapping = _lang_aug()
     if p <= 0:
         return prompt
     text = prompt.item() if hasattr(prompt, "item") else prompt
     alts = mapping.get(_norm_prompt(text))
     # np.random is re-seeded per DataLoader worker, so draws differ across workers.
-    if alts and np.random.random() < p:
+    if alts and (mode == "uniform" or np.random.random() < p):
         return alts[np.random.randint(len(alts))]
     return prompt
 
