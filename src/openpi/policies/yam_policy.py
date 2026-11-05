@@ -5,9 +5,14 @@ Cameras: head (base view), left_wrist, right_wrist
 """
 
 import dataclasses
+import functools
+import logging
+import os
+import pathlib
 
 import einops
 import numpy as np
+import yaml
 
 from openpi import transforms
 from openpi.models import model as _model
@@ -31,6 +36,43 @@ def _parse_image(image) -> np.ndarray:
     if image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
     return image
+
+
+_DEFAULT_ANNOTATIONS = pathlib.Path(__file__).resolve().parents[3] / "yam/config/language_annotations.yaml"
+
+
+def _norm_prompt(text: str) -> str:
+    return " ".join(str(text).split()).lower().rstrip(".!")
+
+
+@functools.lru_cache(maxsize=1)
+def _lang_aug() -> tuple[float, dict[str, list[str]]]:
+    """Language augmentation from env: YAM_LANG_AUG_P (unset/0 = off) and YAM_LANG_ANNOTATIONS (LBM-format yaml).
+    Returns (p, {normalized recorded prompt -> randomized paraphrases}); every `original` of a task maps to its list."""
+    p = float(os.environ.get("YAM_LANG_AUG_P", "0") or 0)
+    if p <= 0:
+        return 0.0, {}
+    path = pathlib.Path(os.environ.get("YAM_LANG_ANNOTATIONS", _DEFAULT_ANNOTATIONS))
+    with open(path) as f:
+        tasks = yaml.safe_load(f)["language_dict"]
+    mapping = {
+        _norm_prompt(o): list(t["randomized"]) for t in tasks.values() for o in t["original"] if t.get("randomized")
+    }
+    logging.info("YAM language augmentation: p=%.2f, %d recorded prompts -> paraphrases from %s", p, len(mapping), path)
+    return p, mapping
+
+
+def augment_prompt(prompt):
+    """With probability YAM_LANG_AUG_P, swap a recorded prompt for one of its paraphrases. Unknown prompts pass through."""
+    p, mapping = _lang_aug()
+    if p <= 0:
+        return prompt
+    text = prompt.item() if hasattr(prompt, "item") else prompt
+    alts = mapping.get(_norm_prompt(text))
+    # np.random is re-seeded per DataLoader worker, so draws differ across workers.
+    if alts and np.random.random() < p:
+        return alts[np.random.randint(len(alts))]
+    return prompt
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,7 +113,7 @@ class YAMInputs(transforms.DataTransformFn):
             inputs["actions"] = data["actions"]
 
         if "prompt" in data:
-            inputs["prompt"] = data["prompt"]
+            inputs["prompt"] = augment_prompt(data["prompt"])  # no-op unless YAM_LANG_AUG_P is set (training only)
 
         return inputs
 
@@ -85,4 +127,3 @@ class YAMOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         return {"actions": np.asarray(data["actions"][:, :14])}
- 
