@@ -23,7 +23,9 @@ from openpi.training import config as C
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default="pi05_yam_abc_mm2_h32"); ap.add_argument("--ckpt", required=True, help="checkpoint step dir")
     ap.add_argument("--val-repo", default="local/abc_mm2_val_v21"); ap.add_argument("--n-per-source", type=int, default=192); ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--wandb-project", default="openpi"); ap.add_argument("--wandb-run", default=None); ap.add_argument("--no-wandb", action="store_true"); a = ap.parse_args()
+    ap.add_argument("--wandb-project", default="openpi"); ap.add_argument("--wandb-run", default=None); ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--group-by", default="abc_molmo", choices=["abc_molmo", "source"], help="source = one group per assembly.json source (e.g. per task for the mt9 repos)")
+    ap.add_argument("--out-json", default=None, help="where to write results (default <ckpt>/eval_val.json)"); a = ap.parse_args()
     cfg = C.get_config(a.config); H = cfg.model.action_horizon; ckpt = pathlib.Path(a.ckpt); step = int(ckpt.name)
     meta = L.LeRobotDatasetMetadata(a.val_repo)
     ds = L.LeRobotDataset(a.val_repo, delta_timestamps={"action": [i / meta.fps for i in range(H)]}, video_backend="pyav")
@@ -39,7 +41,15 @@ def main():
         for _ in range(a.n_per_source):
             e = rng.choice(eps); n = meta.episodes[e]["length"]; fr = rng.randrange(0, max(1, n - H)); out.append(int(starts[e]) + fr)
         return out
-    idx = {k: v for k, v in {"abc": sample("abc"), "molmo": sample("molmo")}.items() if v}
+    if a.group_by == "source":
+        def sample_range(lo, hi):
+            out = []
+            for _ in range(a.n_per_source):
+                e = rng.randrange(lo, hi); n = meta.episodes[e]["length"]; fr = rng.randrange(0, max(1, n - H)); out.append(int(starts[e]) + fr)
+            return out
+        idx = {name: sample_range(sinfo["first_new_episode"], sinfo["first_new_episode"] + sinfo["episodes"]) for name, sinfo in asm["sources"].items() if sinfo["episodes"]}
+    else:
+        idx = {k: v for k, v in {"abc": sample("abc"), "molmo": sample("molmo")}.items() if v}
     policy = PC.create_trained_policy(cfg, ckpt)
     res = {}; t0 = time.time()
     for src, ids in idx.items():
@@ -58,7 +68,7 @@ def main():
              "gripper_openclose_acc": float(np.mean((pr_g > 0.5) == (gt_g > 0.5))), "n_samples": len(ids),
              "mse_per_h": [float(x) for x in np.nanmean(se, axis=(0, 2))], "mae_per_h": [float(x) for x in np.nanmean(ae, axis=(0, 2))]}
         res[src] = r; print(src, {k: (round(v, 5) if isinstance(v, float) else v) for k, v in r.items() if "per_h" not in k}, flush=True)
-    res["eval_seconds"] = time.time() - t0; res["ckpt_step"] = step; json.dump(res, open(ckpt / "eval_val.json", "w"), indent=1)
+    res["eval_seconds"] = time.time() - t0; res["ckpt_step"] = step; json.dump(res, open(a.out_json or (ckpt / "eval_val.json"), "w"), indent=1)
     if not a.no_wandb:
         import wandb
         run = wandb.init(project=a.wandb_project, name=a.wandb_run or f"{cfg.exp_name if hasattr(cfg,'exp_name') else a.config}_eval", id=os.environ.get("EVAL_WANDB_ID"), resume="allow", config={"config": a.config, "val_repo": a.val_repo, "n_per_source": a.n_per_source})

@@ -17,7 +17,17 @@ else DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_
 OUT_URI=${OUT_URI:-s3://tri-ml-datasets-uw2/tri-yam/train_runs/$CFG}
 OPENPI_CACHE_URI=${OPENPI_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/openpi_cache}
 MOLMO_WEBBED=${MOLMO_WEBBED:-s3://tri-ml-datasets-uw2/geyan/anydata/cv_webbed/videos/molmoact2_v2}
-FSDP_DEVICES=${FSDP_DEVICES:-8}
+FSDP_DEVICES=${FSDP_DEVICES:-8}; NUM_WORKERS=${NUM_WORKERS:-32}
+# multi-instance (instance_count > 1): one JAX process per instance, algo-1 = coordinator; checkpoints use the OPENPI_LOCAL_CKPT
+# layout (every host writes its shards locally and uploads them to the SAME CK_URI; a step is committed when all hosts' markers exist)
+RC=/opt/ml/input/config/resourceconfig.json
+if [ -f $RC ]; then
+  export OPENPI_NPROC=$(python3 -c "import json;print(len(json.load(open('$RC'))['hosts']))")
+  export OPENPI_PROC_ID=$(python3 -c "import json;c=json.load(open('$RC'));print(sorted(c['hosts']).index(c['current_host']))")
+  export OPENPI_COORD_ADDR="$(python3 -c "import json;print(sorted(json.load(open('$RC'))['hosts'])[0])"):${OPENPI_COORD_PORT:-29500}"
+else export OPENPI_NPROC=1 OPENPI_PROC_ID=0; fi
+export CKPT_HOSTS=$OPENPI_NPROC CKPT_RANK=$OPENPI_PROC_ID OPENPI_LOCAL_DEVICES=$FSDP_DEVICES
+[ "$OPENPI_NPROC" -gt 1 ] && export OPENPI_LOCAL_CKPT=1
 CODE=${CODE:-/opt/ml/code/yam_openpi}; S=$CODE/yam/pretrain; PY=$CODE/.venv/bin/python
 CK_URI=${CK_URI:-$OUT_URI/$EXP/checkpoints_${SM_QUEUE:-default}/$CFG/$EXP}; RESUME_FROM_URI=${RESUME_FROM_URI:-$CK_URI}
 log(){ echo "$(date -u +%FT%TZ) [sm_entry] $*"; }
@@ -41,7 +51,10 @@ if [ ! -f $OPENPI_DATA_HOME/openpi-assets/checkpoints/pi05_base/params/_METADATA
 fi
 ls $OPENPI_DATA_HOME/openpi-assets/checkpoints/pi05_base/params | head -3
 
-TRAIN=$HF_LEROBOT_HOME/local/abc_mm2_train_v21; VAL=$HF_LEROBOT_HOME/local/abc_mm2_val_v21
+# repo names must match the config's data.repo_id / norm-stats asset_id (smoke config uses local/abc_mm2_smoke_v21)
+[ "$MODE" = "smoke" ] && TRAIN_REPO=${TRAIN_REPO:-abc_mm2_smoke_v21} || TRAIN_REPO=${TRAIN_REPO:-abc_mm2_train_v21}
+VAL_REPO=${VAL_REPO:-abc_mm2_val_v21}; ASSET=assets/$CFG/local/$TRAIN_REPO
+TRAIN=$HF_LEROBOT_HOME/local/$TRAIN_REPO; VAL=$HF_LEROBOT_HOME/local/$VAL_REPO
 stage_convert(){ # $1 = s3 repo uri, $2 = local repo dir, $3 = stage out dir
   if [ -f $3/source.json ]; then return 0; fi
   [ -f $2/meta/info.json ] || { mkdir -p $2; $S5 cp --exclude "*lowdim_pack/*" "$1/*" $2/ >/dev/null || { log "download FAILED $1"; return 1; }; }
@@ -63,6 +76,24 @@ if [ $S2 = 1 ]; then
   WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,stage2,yam_s2_train_v21,joint14_abs,horizon32,sagemaker,h100}
 else
 t_stage0=$(date +%s)
+# 1b. MODE=finetune: data = a prebuilt v2.1 repo cache (DATA_TRAIN_URI, must have <root>/_COMPLETE); init = a pretrain checkpoint
+#     (INIT_URI = .../<step>/ with params/ + assets/). No staging, no norm stats (the PRETRAIN stats travel with the init assets), no val.
+if [ "$MODE" = "finetune" ]; then
+  DATA_TRAIN_URI=${DATA_TRAIN_URI:?s3 prefix of the v2.1 train repo}; INIT_URI=${INIT_URI:?s3 prefix of the pretrain step (params/, assets/)}
+  if [ ! -f $TRAIN/meta/info.json ]; then
+    [ -n "${DATA_COMPLETE_URI:-}" ] && { $S5 ls "$DATA_COMPLETE_URI" >/dev/null 2>&1 || { log "FATAL data cache incomplete: $DATA_COMPLETE_URI missing"; exit 6; }; }
+    log "fetching finetune repo $DATA_TRAIN_URI -> $TRAIN"; t0=$(date +%s); $S5 cp "$DATA_TRAIN_URI/*" $TRAIN/ >/dev/null || { log "FATAL repo fetch failed"; exit 6; }; log "repo fetched in $(( $(date +%s)-t0 ))s"
+  fi
+  [ -f $TRAIN/lowdim_mm/action.npy ] || { log "building lowdim memmaps"; $PY $S/build_lowdim_memmap.py $TRAIN --workers 32 >> $W/logs/memmap.log 2>&1 || { log "FATAL memmap failed"; exit 5; }; }
+  INIT_STEP=$(basename "${INIT_URI%/}"); INIT=$W/init/$INIT_STEP; mkdir -p $INIT
+  if [ ! -f $INIT/params/_METADATA ]; then log "fetching init checkpoint $INIT_URI -> $INIT"; t0=$(date +%s); $S5 cp --exclude "*train_state/*" --exclude "deploy_metadata.json" --exclude ".complete" "$INIT_URI/*" $INIT/ >/dev/null || { log "FATAL init fetch failed"; exit 7; }; log "init fetched in $(( $(date +%s)-t0 ))s"; fi
+  ls $INIT/params | head -3; ls $INIT/assets/*/ 2>/dev/null | head -3
+  export YAM_PRETRAIN_PARAMS=$INIT/params YAM_PRETRAIN_ASSETS_DIR=$INIT/assets YAM_FT_REPO_ID=local/$TRAIN_REPO
+  [ -n "${YAM_TASK_TEMPERATURE:-}" ] && export YAM_TASK_TEMPERATURE && log "task temperature $YAM_TASK_TEMPERATURE"
+  jq -c '{total_episodes,total_frames,total_tasks,fps}' $TRAIN/meta/info.json; cp $TRAIN/meta/info.json $TRAIN/meta/tasks.jsonl $W/logs/ 2>/dev/null
+  echo "init=$INIT_URI data=$DATA_TRAIN_URI temperature=${YAM_TASK_TEMPERATURE:-1.0}" > $W/logs/finetune_provenance.txt
+  EVAL_WATCH=${EVAL_WATCH:-0}; VAL=/nonexistent
+else
 # 2. data: cache first
 if [ "$MODE" = "full" ] && $S5 ls "$DATA_CACHE_URI/_COMPLETE" >/dev/null 2>&1 && [ ! -f $TRAIN/meta/info.json ]; then
   log "data cache hit: $DATA_CACHE_URI -> $HF_LEROBOT_HOME/local"; $S5 cp "$DATA_CACHE_URI/train/*" $TRAIN/ >/dev/null && $S5 cp "$DATA_CACHE_URI/val/*" $VAL/ >/dev/null || { log "cache fetch failed, falling back to build"; rm -rf $TRAIN $VAL; }
@@ -95,8 +126,9 @@ if [ ! -f $TRAIN/meta/info.json ]; then
   $PY $S/build_lowdim_memmap.py $TRAIN --workers 48 >> $W/logs/memmap.log 2>&1 || { log "FATAL train memmap failed"; exit 5; }
   [ -f $VAL/meta/info.json ] && { $PY $S/build_lowdim_memmap.py $VAL --workers 32 >> $W/logs/memmap.log 2>&1 || log "WARN val memmap failed"; }
   # 4. exact norm stats (float64) for the train repo
-  $PY $S/norm_stats_exact.py $TRAIN assets/$CFG/local/abc_mm2_train_v21 --workers 64 >> $W/logs/norm_stats.log 2>&1 || { log "FATAL norm stats failed"; exit 4; }
-  cp assets/$CFG/local/abc_mm2_train_v21/norm_stats.json $TRAIN/meta/norm_stats_$CFG.json
+  # streaming-histogram stats (minutes) with the exact single-core version as fallback (the exact np.quantile sort took 25 min)
+  $PY $S/norm_stats_fast.py $TRAIN $ASSET >> $W/logs/norm_stats.log 2>&1 || $PY $S/norm_stats_exact.py $TRAIN $ASSET --workers 64 >> $W/logs/norm_stats.log 2>&1 || { log "FATAL norm stats failed"; exit 4; }
+  cp $ASSET/norm_stats.json $TRAIN/meta/norm_stats_$CFG.json
   # 5. cache the built repos (background, low priority) so restarts / future runs skip all of the above
   if [ "$MODE" = "full" ] && [ "${CACHE_UPLOAD:-1}" = "1" ]; then
     ( nice -n 19 $S5 --numworkers 64 cp $TRAIN/ "$DATA_CACHE_URI/train/" >/dev/null && nice -n 19 $S5 --numworkers 64 cp $VAL/ "$DATA_CACHE_URI/val/" >/dev/null \
@@ -106,13 +138,14 @@ else
   log "train repo present ($(jq -r .total_episodes $TRAIN/meta/info.json) eps); norm stats from repo"
   [ -f $TRAIN/lowdim_mm/action.npy ] || $PY $S/build_lowdim_memmap.py $TRAIN --workers 48 >> $W/logs/memmap.log 2>&1
   [ -f $VAL/meta/info.json ] && [ ! -f $VAL/lowdim_mm/action.npy ] && $PY $S/build_lowdim_memmap.py $VAL --workers 32 >> $W/logs/memmap.log 2>&1
-  mkdir -p assets/$CFG/local/abc_mm2_train_v21; cp $TRAIN/meta/norm_stats_$CFG.json assets/$CFG/local/abc_mm2_train_v21/norm_stats.json 2>/dev/null || \
-    $PY $S/norm_stats_exact.py $TRAIN assets/$CFG/local/abc_mm2_train_v21 --workers 64 >> $W/logs/norm_stats.log 2>&1
+  mkdir -p $ASSET; cp $TRAIN/meta/norm_stats_$CFG.json $ASSET/norm_stats.json 2>/dev/null || \
+    { $PY $S/norm_stats_fast.py $TRAIN $ASSET >> $W/logs/norm_stats.log 2>&1 || $PY $S/norm_stats_exact.py $TRAIN $ASSET --workers 64 >> $W/logs/norm_stats.log 2>&1; }
 fi
 fi  # S2
 jq -c '{total_episodes,total_frames,total_tasks,fps}' $TRAIN/meta/info.json; [ -f $VAL/meta/info.json ] && jq -c '{val_episodes:.total_episodes,val_frames:.total_frames}' $VAL/meta/info.json
 export YAM_ASSEMBLY_JSON=$TRAIN/meta/assembly.json
-cp $TRAIN/meta/assembly.json $TRAIN/meta/info.json assets/$CFG/local/abc_mm2_train_v21/norm_stats.json $W/logs/ 2>/dev/null
+cp $TRAIN/meta/assembly.json $TRAIN/meta/info.json $ASSET/norm_stats.json $W/logs/ 2>/dev/null
+fi   # end MODE != finetune
 $S5 cp $W/logs/ "$OUT_URI/$EXP/logs_prep/" >/dev/null 2>&1 || true
 
 # 6. resume: local scratch is empty on a fresh instance, so restore the latest committed step of RESUME_FROM_URI (orbax tmp dirs are ignored)
@@ -134,25 +167,26 @@ mkdir -p $CK
 eval_pass(){ for st in $(local_steps $CKD); do d=$CKD/$st; grep -qx "$st" $W/logs/eval_done.txt && continue
     [ -f $d/_CHECKPOINT_METADATA ] && [ -d $d/params ] || continue
     log "eval ckpt $st"; t0=$(date +%s)
-    if JAX_PLATFORMS=cpu $PY $S/eval_ckpt.py --config $CFG --ckpt $d --val-repo local/abc_mm2_val_v21 --wandb-run ${EXP}_eval --n-per-source ${EVAL_N:-192} >> $W/logs/eval.log 2>&1; then
+    if JAX_PLATFORMS=cpu $PY $S/eval_ckpt.py --config $CFG --ckpt $d --val-repo local/$VAL_REPO --wandb-run ${EXP}_eval --n-per-source ${EVAL_N:-192} >> $W/logs/eval.log 2>&1; then
       echo $st >> $W/logs/eval_done.txt; log "eval ckpt $st done in $(( $(date +%s)-t0 ))s"; $S5 cp $d/eval_val.json "$OUT_URI/$EXP/eval/eval_val_$st.json" >/dev/null 2>&1
     else log "eval FAILED $st (see logs/eval.log)"; echo $st >> $W/logs/eval_done.txt; fi; done; }
 EVAL_PID=""
-if [ -f $VAL/meta/info.json ] && [ "${EVAL_WATCH:-1}" = "1" ]; then
+if [ -f $VAL/meta/info.json ] && [ "${EVAL_WATCH:-1}" = "1" ] && [ "$OPENPI_PROC_ID" = 0 ]; then
   touch $W/logs/eval_done.txt
   ( while true; do eval_pass; [ -f $W/STOP_EVAL ] && { eval_pass; break; }; sleep ${EVAL_POLL:-300}; done ) & EVAL_PID=$!
 fi
 
 # 8. train
 ls -la $TRAIN/lowdim_mm/ 2>/dev/null | tail -2
-log "starting training: $CFG exp=$EXP fsdp=$FSDP_DEVICES $RESUME ${TRAIN_OVERRIDES:-}"
-export WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,abc130k_v3ar,molmoact2_v3ar,lerobot_v3,joint14_abs,horizon32,sagemaker,h100}
-$PY scripts/train.py $CFG --exp-name $EXP --checkpoint-base-dir $CK --fsdp-devices $FSDP_DEVICES $RESUME ${TRAIN_OVERRIDES:-} 2>&1 | tee -a $W/logs/train.log
+log "starting training: $CFG exp=$EXP hosts=$OPENPI_NPROC rank=$OPENPI_PROC_ID coord=${OPENPI_COORD_ADDR:-} fsdp=$((FSDP_DEVICES*OPENPI_NPROC)) $RESUME ${TRAIN_OVERRIDES:-}"
+export WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,abc130k_v3ar,molmoact2_v3ar,lerobot_v3,joint14_abs,horizon32,sagemaker,h100}; [ -n "${YAM_PRETRAIN_PARAMS:-}" ] && log "init params: $YAM_PRETRAIN_PARAMS"
+[ -z "$RESUME" ] && OVERWRITE="--overwrite" || OVERWRITE=""
+$PY scripts/train.py $CFG --exp-name $EXP --checkpoint-base-dir $CK --fsdp-devices $((FSDP_DEVICES*OPENPI_NPROC)) --num-workers $NUM_WORKERS $RESUME $OVERWRITE ${TRAIN_OVERRIDES:-} 2>&1 | tee -a $W/logs/train.log
 rc=${PIPESTATUS[0]}; log "train exited rc=$rc"
 touch $W/STOP_EVAL; [ -n "$EVAL_PID" ] && { log "waiting for the eval watcher's final pass"; timeout ${EVAL_FINAL_TIMEOUT:-7200} tail --pid=$EVAL_PID -f /dev/null; }
 # 9. last checkpoint sync (stop the loop first: one writer), then final params (committed steps only) + logs
 pkill -TERM -P $SYNC_PID 2>/dev/null; kill $SYNC_PID 2>/dev/null; wait $SYNC_PID 2>/dev/null; sync_pass $CKD "$CK_URI" >> $W/logs/ckpt_sync.log 2>&1
 LAST=$(local_steps $CKD | tail -1)
 if [ -n "$LAST" ]; then log "publishing $LAST -> $OUT_URI/$EXP/final/"; put_step $CKD/$LAST "$OUT_URI/$EXP/final" || log "WARN final copy failed"; fi
-$S5 cp $W/logs/ "$OUT_URI/$EXP/logs/" >/dev/null 2>&1 || true
+$S5 cp $W/logs/ "$OUT_URI/$EXP/logs/rank$OPENPI_PROC_ID/" >/dev/null 2>&1 || true
 kill $(jobs -p) 2>/dev/null; exit $rc

@@ -18,4 +18,13 @@ ok "restored step is a committed local step" '[ "$(local_steps $N)" = 40000 ]'
 P=$T/plain/cfg/exp; mkdir -p $P/5000.orbax-checkpoint-tmp-0; echo m > $P/5000.orbax-checkpoint-tmp-0/_CHECKPOINT_METADATA; echo old > $P/wandb_id.txt
 resume_latest $P $T/n2 > /dev/null; rc=$?; ok "only an orbax tmp dir remotely -> fresh start (rc 1)" '[ $rc = 1 ]'
 rm $R/wandb_id.txt; resume_latest $R $T/n3 > /dev/null 2>&1; rc=$?; ok "committed step but no wandb_id -> refuse (rc 2)" '[ $rc = 2 ]'
+# multi-host layout: two hosts upload their shards of the same step to one remote; committed only when both markers exist; rank 1 never prunes
+M=$T/mh; mkdir -p $M/h0/5000/params $M/h1/5000/params $M/h0/6000/params; echo a > $M/h0/5000/params/0.0; echo b > $M/h1/5000/params/1.0
+echo m > $M/h0/5000/_CHECKPOINT_METADATA; cp $M/h0/5000/_CHECKPOINT_METADATA $M/h1/5000/; echo m > $M/h0/6000/_CHECKPOINT_METADATA; echo c > $M/h0/6000/params/0.0; echo wid > $M/h0/wandb_id.txt
+MR=$M/remote; (CKPT_HOSTS=2 CKPT_RANK=0 sync_pass $M/h0 $MR) > /dev/null
+ok "mh: one host's upload is not a committed step" '[ -f $MR/5000/_UPLOADED.0 ] && [ -z "$(CKPT_HOSTS=2 remote_steps $MR)" ]'
+(CKPT_HOSTS=2 CKPT_RANK=1 sync_pass $M/h1 $MR) > /dev/null
+ok "mh: both markers -> committed, union has both shards, 6000 (rank0 only) still partial" '[ "$(CKPT_HOSTS=2 remote_steps $MR | xargs)" = 5000 ] && [ -f $MR/5000/params/0.0 ] && [ -f $MR/5000/params/1.0 ] && [ -d $MR/6000 ]'
+MN=$M/new; st=$(CKPT_HOSTS=2 resume_latest $MR $MN); rc=$?
+ok "mh: resume = union of the committed step, markers stripped" '[ $rc = 0 ] && [ "$st" = 5000 ] && [ -f $MN/5000/params/1.0 ] && [ -z "$(ls $MN/5000 | grep _UPLOADED)" ]'
 [ $fails = 0 ] && echo "all ok" || { echo "$fails failed"; exit 1; }
