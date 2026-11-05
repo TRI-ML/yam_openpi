@@ -85,6 +85,11 @@ if [ "$MODE" = "finetune" ]; then
     log "fetching finetune repo $DATA_TRAIN_URI -> $TRAIN"; t0=$(date +%s); $S5 cp "$DATA_TRAIN_URI/*" $TRAIN/ >/dev/null || { log "FATAL repo fetch failed"; exit 6; }; log "repo fetched in $(( $(date +%s)-t0 ))s"
   fi
   [ -f $TRAIN/lowdim_mm/action.npy ] || { log "building lowdim memmaps"; $PY $S/build_lowdim_memmap.py $TRAIN --workers 32 >> $W/logs/memmap.log 2>&1 || { log "FATAL memmap failed"; exit 5; }; }
+  # optional held-out split (DATA_VAL_URI, same v2.1 format) -> $VAL, scored per committed step by the rank-0 eval watcher (step 7; EVAL_EXTRA e.g. "--group-by source")
+  if [ -n "${DATA_VAL_URI:-}" ] && [ ! -f $VAL/meta/info.json ]; then
+    log "fetching finetune val repo $DATA_VAL_URI -> $VAL"; $S5 cp "$DATA_VAL_URI/*" $VAL/ >/dev/null || { log "FATAL val repo fetch failed"; exit 6; }
+    [ -f $VAL/lowdim_mm/action.npy ] || $PY $S/build_lowdim_memmap.py $VAL --workers 16 >> $W/logs/memmap.log 2>&1 || { log "FATAL val memmap failed"; exit 5; }
+  fi
   INIT_STEP=$(basename "${INIT_URI%/}"); INIT=$W/init/$INIT_STEP; mkdir -p $INIT
   if [ ! -f $INIT/params/_METADATA ]; then log "fetching init checkpoint $INIT_URI -> $INIT"; t0=$(date +%s); $S5 cp --exclude "*train_state/*" --exclude "deploy_metadata.json" --exclude ".complete" "$INIT_URI/*" $INIT/ >/dev/null || { log "FATAL init fetch failed"; exit 7; }; log "init fetched in $(( $(date +%s)-t0 ))s"; fi
   ls $INIT/params | head -3; ls $INIT/assets/*/ 2>/dev/null | head -3
@@ -167,7 +172,7 @@ mkdir -p $CK
 eval_pass(){ for st in $(local_steps $CKD); do d=$CKD/$st; grep -qx "$st" $W/logs/eval_done.txt && continue
     [ -f $d/_CHECKPOINT_METADATA ] && [ -d $d/params ] || continue
     log "eval ckpt $st"; t0=$(date +%s)
-    if JAX_PLATFORMS=cpu $PY $S/eval_ckpt.py --config $CFG --ckpt $d --val-repo local/$VAL_REPO --wandb-run ${EXP}_eval --n-per-source ${EVAL_N:-192} >> $W/logs/eval.log 2>&1; then
+    if JAX_PLATFORMS=cpu $PY $S/eval_ckpt.py --config $CFG --ckpt $d --val-repo local/$VAL_REPO --wandb-run ${EXP}_eval --n-per-source ${EVAL_N:-192} ${EVAL_EXTRA:-} >> $W/logs/eval.log 2>&1; then
       echo $st >> $W/logs/eval_done.txt; log "eval ckpt $st done in $(( $(date +%s)-t0 ))s"; $S5 cp $d/eval_val.json "$OUT_URI/$EXP/eval/eval_val_$st.json" >/dev/null 2>&1
     else log "eval FAILED $st (see logs/eval.log)"; echo $st >> $W/logs/eval_done.txt; fi; done; }
 EVAL_PID=""
