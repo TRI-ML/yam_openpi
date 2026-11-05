@@ -1,0 +1,90 @@
+# Set of language instructions for the nine canonical YAM tasks (yam_mt9x200_v1).
+# Same schema as robotics/lbm diffusion_policy/config/task/language_annotations.yaml.
+# Meant for training.
+#   original: the operator prompt(s) as recorded in the episodes (SortUtensils has three variants; the full one first)
+#   randomized: 5 paraphrases per task, written by GPT-6 Astra after looking at head- and wrist-camera frames of two
+#               demonstrations per task, so the nouns match the real objects (see language_annotations_notes.md)
+language_dict:
+  HangMugs:
+    original:
+    - Place a mug tree in the middle of the table with three mugs spread around it, then hang each mug onto a branch of the tree by its handle.
+    randomized:
+    - place a mug tree in the middle of the table, spread three mugs around it, then hang each by its handle on a branch
+    - set a mug tree at the table's center with three mugs spread around it, then suspend each mug by its handle from a branch
+    - position a mug tree centrally on the table, arrange three mugs around it, then hook each mug's handle over a branch
+    - put a mug tree in the table's middle and spread three mugs around it, then hang the mugs by their handles on its branches
+    - arrange three mugs around a mug tree placed in the middle of the table, then hang each mug by its handle from a branch
+  PlaceTeaBagInTeapot:
+    original:
+    - Place the teabag into the teapot
+    randomized:
+    - place the tea bag into the black teapot
+    - put the tea bag from the blue plate inside the teapot
+    - transfer the tea bag from the plate into the open teapot
+    - pick up the tea bag and deposit it inside the teapot
+    - move the tea bag into the teapot from the blue plate
+  SweepBeans:
+    original:
+    - Sweep up the beans using the hand broom and dustpan then return the tools back to the table
+    randomized:
+    - sweep the beans into the dustpan with the hand broom, then return both tools to the table
+    - use the hand broom and dustpan to gather the beans, then put both tools back on the table
+    - collect the beans with the hand broom and dustpan before returning the tools to the table
+    - brush the beans into the dustpan using the hand broom, then place both tools back on the table
+    - clean up the beans using the hand broom and dustpan, then set the tools back on the table
+  MakeCoffee:
+    original:
+    - Place the cup into the coffee maker, close the lid and place the mug underneath the spout
+    randomized:
+    - insert the coffee pod into the coffee maker, close the lid, and place the mug beneath the spout
+    - load the coffee maker with the coffee pod, shut the lid, then position the mug under the spout
+    - put the coffee pod in the coffee maker, lower the lid closed, and set the mug beneath the spout
+    - place the coffee pod inside the coffee maker, close its lid, then move the mug underneath the spout
+    - fit the coffee pod into the coffee maker, shut its lid, and bring the mug under the spout
+  ToastBread:
+    original:
+    - Place the slice of bread in the toaster then place it on the plate when it is done
+    randomized:
+    - put the slice of bread into the toaster, then place it on the plate when it is done
+    - insert the bread slice into the toaster and transfer it to the plate once it has finished toasting
+    - toast the slice of bread in the toaster, then set it on the plate when ready
+    - load the toaster with the slice of bread, then move it onto the plate after toasting
+    - place the bread slice in the toaster and, when it is done, take it out and lay it on the plate
+  CleanUpSpill:
+    original:
+    - Pick up the mug and place it off to the side then use the towel to clean up the spill, return the towel to the side when done
+    randomized:
+    - pick up the blue mug and set it aside, then wipe up the spill with the towel and return the towel to the side
+    - lift the mug and place it to one side, then clean the spill with the towel and put the towel back beside the tray
+    - move the mug aside by picking it up, then use the towel to absorb the spill and return the towel to the side
+    - pick up and reposition the mug to the side, wipe the spill with the towel, then place the towel back to the side
+    - lift and set the mug aside before cleaning the spill with the towel, then return the towel to its place beside the tray
+  BuildSprinkler:
+    original:
+    - Assemble the sprinkler and place it back on the table
+    randomized:
+    - assemble the sprinkler and set it back on the table
+    - put the sprinkler together and return it to the table
+    - build the sprinkler, then place the assembled sprinkler back on the table
+    - fit the sprinkler parts together and put the sprinkler back on the table
+    - complete the sprinkler assembly and set the sprinkler back onto the table
+  SortUtensils:
+    original:
+    - Pick up every utensil and place it into the tray, grouped by type — forks in one compartment, knives in another, spoons in a third.
+    - Pick up every utensil and place it into the tray, grouped by type — forks in one compartment, knives
+    - Sort the utensils scattered around the table into the divided tray in the middle, grouped by type
+    randomized:
+    - pick up all the scattered utensils and sort them into the divided tray, keeping forks, knives, and spoons in separate compartments
+    - collect every loose fork, knife, and spoon from the table and place each type in its own tray compartment
+    - sort the utensils around the tray by type, placing all forks together, all knives together, and all spoons together
+    - move every scattered utensil from the table into the divided tray, grouping matching types in separate compartments
+    - gather the loose utensils into the tray in the middle, using separate compartments for forks, knives, and spoons
+  BikeRotorToolUse:
+    original:
+    - Use the supplied tool to tighten the lock ring onto the bike rotor
+    randomized:
+    - use the supplied tool to tighten the lock ring onto the bicycle rotor
+    - tighten the bike rotor lock ring with the provided tool
+    - secure the rotor by tightening its lock ring using the supplied tool
+    - with the provided tool, tighten the lock ring that secures the bike rotor
+    - fasten the bicycle rotor securely by tightening the lock ring with the supplied tool
