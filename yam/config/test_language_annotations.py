@@ -12,9 +12,10 @@ def test_language_annotations():
     assert set(d) == TASKS
     for task, v in d.items():
         assert set(v) == {"original", "randomized"}, task
-        assert len(v["original"]) >= 1 and len(v["randomized"]) == 5, task
+        assert len(v["original"]) >= 1, task
+        assert len(v["randomized"]) == 5, task
         items = v["original"] + v["randomized"]
-        assert len(set(s.lower() for s in items)) == len(items), f"duplicate prompt in {task}"
+        assert len({s.lower() for s in items}) == len(items), f"duplicate prompt in {task}"
         assert all(s == s.strip() and not s.endswith(".") for s in v["randomized"]), task
     # the reset task (take the tea bag OUT) must never leak into the forward task's prompts
     for s in d["PlaceTeaBagInTeapot"]["original"] + d["PlaceTeaBagInTeapot"]["randomized"]:
