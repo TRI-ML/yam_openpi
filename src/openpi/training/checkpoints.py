@@ -76,7 +76,8 @@ def initialize_checkpoint_dir(
 
     # local layout: plain zarr (one chunk file per shard, distinct names across hosts) so per-host dirs union cleanly;
     # OCDBT would give every host its own manifest.ocdbt and the union would keep only one.
-    mp_opts = ocp.options.MultiprocessingOptions(primary_host=None) if local_ckpt else None
+    # orbax expects an options instance (None breaks: .primary_host lookup); default = primary host 0 (shared-FS layout)
+    mp_opts = ocp.options.MultiprocessingOptions(primary_host=None if local_ckpt else 0)
     tree_handler = functools.partial(
         ocp.PyTreeCheckpointHandler, use_ocdbt=not local_ckpt, use_zarr3=not local_ckpt, multiprocessing_options=mp_opts
     )
