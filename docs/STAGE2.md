@@ -312,3 +312,14 @@ table, "prompt remap … 1431 of 1783 task strings remapped", `prefix/*_frac` ~0
 SageMaker: image `s3-<sha>`, `launch_pi05.py --cfg pi05_yam_s3_meta --exp pi05_yam_s3_meta_sm_p5 --priority 300 --max-run-days 3
 --data-cache-uri s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2v2_train_v21 --env "TRAIN_OVERRIDES=… --num-train-steps 120000
 --lr-schedule.decay-steps 120000 …"`. ~29 h at 0.86 s/step.
+
+## v3 sim-only (`pi05_yam_s3sim_meta`, 2026-11-06)
+
+Twin of `pi05_yam_s3_meta` with `strata_mix = {real_success: 0, real_failure: 0, sim_success: .5, sim_failure: .5}`: every batch is
+ABC-sim teleop : ABC-sim failure rollouts exactly 1:1, no real data. Zero-share strata are dropped by the sampler (their sources are
+simply never drawn; logged at init). Same warm start, norm stats, prompt remap (the only thing separating the two pools' prompts is
+then the `<quality=…>` token) and per-field dropout. At 120k x 128: teleop 7.68M draws / 44.4M frames = 0.17 epochs, failures
+7.68M / 23.9M = 0.32 epochs. Per-task overlap after the remap: failures exist for only 8 of the 24 teleop task names (46% of teleop
+frames); a task-matched 1:1 would need the other 16 tasks' failures (not available) or dropping those tasks. Smoke / launch as v3 with
+`CFG=pi05_yam_s3sim_meta EXP=pi05_yam_s3sim_meta_sm_p5`, image `s3sim-<sha>`; dgx06 `/local` was full, so the smoke writes checkpoints
+to NFS via `--checkpoint-base-dir /datasets/aliangdw/stage2/smoke_ckpts`.
