@@ -22,9 +22,10 @@ FSDP_DEVICES=${FSDP_DEVICES:-8}; NUM_WORKERS=${NUM_WORKERS:-32}
 # layout (every host writes its shards locally and uploads them to the SAME CK_URI; a step is committed when all hosts' markers exist)
 RC=/opt/ml/input/config/resourceconfig.json
 if [ -f $RC ]; then
-  export OPENPI_NPROC=$(python3 -c "import json;print(len(json.load(open('$RC'))['hosts']))")
-  export OPENPI_PROC_ID=$(python3 -c "import json;c=json.load(open('$RC'));print(sorted(c['hosts']).index(c['current_host']))")
-  export OPENPI_COORD_ADDR="$(python3 -c "import json;print(sorted(json.load(open('$RC'))['hosts'])[0])"):${OPENPI_COORD_PORT:-29500}"
+  # (jq, not python3: the image has no system python, only the uv venv)
+  export OPENPI_NPROC=$(jq -r '.hosts | length' $RC)
+  export OPENPI_PROC_ID=$(jq -r --arg me "$(jq -r .current_host $RC)" '.hosts | sort | index($me)' $RC)
+  export OPENPI_COORD_ADDR="$(jq -r '.hosts | sort | .[0]' $RC):${OPENPI_COORD_PORT:-29500}"
 else export OPENPI_NPROC=1 OPENPI_PROC_ID=0; fi
 export CKPT_HOSTS=$OPENPI_NPROC CKPT_RANK=$OPENPI_PROC_ID OPENPI_LOCAL_DEVICES=$FSDP_DEVICES
 [ "$OPENPI_NPROC" -gt 1 ] && export OPENPI_LOCAL_CKPT=1
