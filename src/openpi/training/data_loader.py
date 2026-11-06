@@ -319,10 +319,16 @@ class StratifiedMixSampler(torch.utils.data.Sampler):
         if unknown := set(strata_mix) - {"real_success", "real_failure", "sim_success", "sim_failure"}:
             raise ValueError(f"unknown strata {sorted(unknown)}")
         for st in set(strata_mix) - present:
-            logging.warning(f"stratum {st!r} has no frames in the repo; dropped")
+            if strata_mix[st] > 0:
+                logging.warning(f"stratum {st!r} has no frames in the repo; dropped")
         if missing := present - set(strata_mix):
             raise ValueError(f"strata {sorted(missing)} present in the repo but not in strata_mix {strata_mix}")
-        z = sum(w for st, w in strata_mix.items() if st in present)
+        for st in [st for st in present if strata_mix[st] <= 0]:  # zero-share strata (sim-only runs): pools dropped, sources unused
+            logging.info(f"stratum {st!r} has share 0; its sources {sorted(src for s2, src in pools if s2 == st)} are not sampled")
+            pools = {k: v for k, v in pools.items() if k[0] != st}
+        if not pools:
+            raise ValueError(f"no stratum with positive share is present in the repo: {strata_mix}")
+        z = sum(w for st, w in strata_mix.items() if st in {s2 for s2, _ in pools})
         self._starts, self._lens, self._p, self._names, frames = [], [], [], [], []
         for (st, src), rr in sorted(pools.items()):
             n = sum(b - a for a, b in rr)
