@@ -239,3 +239,31 @@ def test_s3_config():
         "grab clutter", "put relative", "pouring beads", "hang the mug on the mug rack", "turn the mug right side up",
         "throw plastic bottles in bin", "sweep away paper scraps from the table", "load the plates into the dish rack"}
     assert c.lr_schedule.decay_steps == c.num_train_steps == 120_000
+
+
+def test_stratified_mix_sampler_sim_only():
+    eps = []
+    f0 = 0
+    for src, q, d, n in (("abc", 1, 0, 1000), ("oopsie_A", 0, 0, 100), ("absim_teleop", 1, 1, 3000), ("absim", 0, 1, 1000)):
+        eps.append({"episode_index": len(eps), "source": src, "quality": q, "domain": d, "first_frame": f0, "length": n})
+        f0 += n
+    mix = {"real_success": 0.0, "real_failure": 0.0, "sim_success": 0.5, "sim_failure": 0.5}
+    s = _data_loader.StratifiedMixSampler(eps, mix, num_samples=200_000, seed=0)
+    idx = np.fromiter(iter(s), np.int64)
+    assert idx.min() >= 1100  # real pools never drawn
+    assert abs(np.mean((idx >= 1100) & (idx < 4100)) - 0.5) < 0.01 and abs(np.mean(idx >= 4100) - 0.5) < 0.01
+    assert s._names == ["sim_failure/absim", "sim_success/absim_teleop"]
+    # a positive-share stratum that is absent is dropped (warning) and the rest renormalised
+    s2 = _data_loader.StratifiedMixSampler([e for e in eps if e["source"] != "absim"], mix, num_samples=50_000, seed=0)
+    idx2 = np.fromiter(iter(s2), np.int64)
+    assert idx2.min() >= 1100 and idx2.max() < 4100
+    with pytest.raises(ValueError, match="no stratum"):
+        _data_loader.StratifiedMixSampler([e for e in eps if e["domain"] == 0], mix, num_samples=1)
+
+
+def test_s3sim_config():
+    c = _config.get_config("pi05_yam_s3sim_meta")
+    b = c.data.base_config
+    assert b.strata_mix == {"real_success": 0.0, "real_failure": 0.0, "sim_success": 0.5, "sim_failure": 0.5}
+    assert b.meta_prefix_field_dropout and b.prompt_remap_json and c.data.repo_id == "local/yam_s2v2_train_v21"
+    assert c.lr_schedule.decay_steps == c.num_train_steps == 120_000 and c.save_interval == 5_000
