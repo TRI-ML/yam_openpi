@@ -72,7 +72,8 @@ def _lang_aug() -> tuple[str, float, dict[str, list[str]]]:
             continue
         for o in originals:
             mapping[_norm_prompt(o)] = pool
-    logging.info(
+    # warning level on purpose: this runs inside DataLoader worker processes, whose loggers sit at the default WARNING level
+    logging.warning(
         "YAM language augmentation: mode=%s p=%.2f, %d recorded prompts -> candidates from %s",
         mode,
         p,
