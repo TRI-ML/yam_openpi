@@ -187,8 +187,10 @@ ls -la $TRAIN/lowdim_mm/ 2>/dev/null | tail -2
 log "starting training: $CFG exp=$EXP hosts=$OPENPI_NPROC rank=$OPENPI_PROC_ID coord=${OPENPI_COORD_ADDR:-} fsdp=$((FSDP_DEVICES*OPENPI_NPROC)) $RESUME ${TRAIN_OVERRIDES:-}"
 export WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,abc130k_v3ar,molmoact2_v3ar,lerobot_v3,joint14_abs,horizon32,sagemaker,h100}; [ -n "${YAM_PRETRAIN_PARAMS:-}" ] && log "init params: $YAM_PRETRAIN_PARAMS"
 [ -z "$RESUME" ] && OVERWRITE="--overwrite" || OVERWRITE=""
+# watchdog: no "Step N:" line within STEP0_TIMEOUT s of starting (default 20 min; the DataLoader-worker ImportError hang of 2026-11-06) -> kill train, exit 9
+( sleep ${STEP0_TIMEOUT:-1200}; grep -qE '^Step [0-9]+:' $W/logs/train.log || { log "FATAL no training step logged after ${STEP0_TIMEOUT:-1200}s; last log lines: $(tail -n 3 $W/logs/train.log | tr '\n' ' ' | cut -c1-400)"; pkill -f "scripts/train.py $CFG" ; echo 9 > $W/logs/watchdog_rc; } ) & WD_PID=$!
 $PY scripts/train.py $CFG --exp-name $EXP --checkpoint-base-dir $CK --fsdp-devices $((FSDP_DEVICES*OPENPI_NPROC)) --num-workers $NUM_WORKERS $RESUME $OVERWRITE ${TRAIN_OVERRIDES:-} 2>&1 | tee -a $W/logs/train.log
-rc=${PIPESTATUS[0]}; log "train exited rc=$rc"
+rc=${PIPESTATUS[0]}; kill $WD_PID 2>/dev/null; [ -f $W/logs/watchdog_rc ] && rc=$(cat $W/logs/watchdog_rc); log "train exited rc=$rc"
 touch $W/STOP_EVAL; [ -n "$EVAL_PID" ] && { log "waiting for the eval watcher's final pass"; timeout ${EVAL_FINAL_TIMEOUT:-7200} tail --pid=$EVAL_PID -f /dev/null; }
 # 9. last checkpoint sync (stop the loop first: one writer), then final params (committed steps only) + logs
 pkill -TERM -P $SYNC_PID 2>/dev/null; kill $SYNC_PID 2>/dev/null; wait $SYNC_PID 2>/dev/null; sync_pass $CKD "$CK_URI" >> $W/logs/ckpt_sync.log 2>&1
