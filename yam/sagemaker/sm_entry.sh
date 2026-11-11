@@ -2,7 +2,7 @@
 # SageMaker entrypoint: stage Zheyuan's v3ar LeRobot repos -> lossless v2.1 train/val repos -> exact norm stats -> pi05 training
 # with orbax checkpoints in local scratch ($W/checkpoints, never /opt/ml/checkpoints: SageMaker's sync agent raced orbax's writes); a background
 # uploader (ckpt_sync.sh) copies committed steps to CK_URI every 5 min; on (re)start the latest committed step of RESUME_FROM_URI is restored + --resume.
-# Stage 2 (CFG=pi05_yam_s2_*, docs/STAGE2.md): fetches the prebuilt merged repo from DATA_CACHE_URI (needs _COMPLETE), no norm stats
+# Stage 2/3 (CFG=pi05_yam_s2_* / pi05_yam_s2v2_* / pi05_yam_s3_*, docs/STAGE2.md): fetches the prebuilt merged repo from DATA_CACHE_URI (needs _COMPLETE), no norm stats
 # (init params + assets are S3 paths in the config), then the same resume/train/publish steps.
 # Env (set by the launcher): CFG EXP MODE(full|smoke) SRC_ROOT DATA_CACHE_URI OUT_URI OPENPI_CACHE_URI WANDB_* TRAIN_OVERRIDES
 #   CK_URI (default $OUT_URI/$EXP/checkpoints_$SM_QUEUE/$CFG/$EXP) RESUME_FROM_URI (default CK_URI) CKPT_SYNC_EVERY (s, 300)
@@ -11,8 +11,9 @@ set -uo pipefail
 [ "${1:-}" = "train" ] && shift
 CFG=${CFG:-pi05_yam_abc_mm2_h32}; EXP=${EXP:-pi05_full_yam_abc_mm2_h32_sm_p5}; MODE=${MODE:-full}
 SRC_ROOT=${SRC_ROOT:-s3://sagemaker-us-west-2-124224456861/zheyuan.hu/data}
-S2=0; case $CFG in pi05_yam_s2*) S2=1;; esac
-if [ $S2 = 1 ]; then DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/yam_s2_train_v21}
+S2=0; case $CFG in pi05_yam_s2*|pi05_yam_s3*) S2=1;; esac
+S2REPO=yam_s2_train_v21; case $CFG in pi05_yam_s2v2*|pi05_yam_s3*) S2REPO=yam_s2v2_train_v21;; esac  # v2 = v1 + ABC sim teleop; v3 = v2 repo, stratified
+if [ $S2 = 1 ]; then DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/$S2REPO}
 else DATA_CACHE_URI=${DATA_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/abc_molmo_v21}; fi
 OUT_URI=${OUT_URI:-s3://tri-ml-datasets-uw2/tri-yam/train_runs/$CFG}
 OPENPI_CACHE_URI=${OPENPI_CACHE_URI:-s3://tri-ml-datasets-uw2/tri-yam/pretrain_data/openpi_cache}
@@ -64,7 +65,7 @@ stage_convert(){ # $1 = s3 repo uri, $2 = local repo dir, $3 = stage out dir
 }
 if [ $S2 = 1 ]; then
   # 2'. stage 2: fetch only (the repo is built offline, docs/STAGE2.md "Build"); smoke = 200 steps on the same repo
-  TRAIN=$HF_LEROBOT_HOME/local/yam_s2_train_v21
+  TRAIN=$HF_LEROBOT_HOME/local/$S2REPO
   if [ ! -f $TRAIN/meta/assembly.json ]; then
     $S5 ls "$DATA_CACHE_URI/_COMPLETE" >/dev/null 2>&1 || { log "FATAL no $DATA_CACHE_URI/_COMPLETE (upload unfinished?)"; exit 2; }
     log "data cache hit: $DATA_CACHE_URI/train -> $TRAIN"; t0=$(date +%s); mkdir -p $TRAIN
@@ -74,7 +75,7 @@ if [ $S2 = 1 ]; then
   [ -f $TRAIN/meta/assembly.json ] || { log "FATAL $TRAIN/meta/assembly.json missing"; exit 2; }
   [ -f $TRAIN/lowdim_mm/action.npy ] || $PY $S/build_lowdim_memmap.py $TRAIN --workers 48 >> $W/logs/memmap.log 2>&1 || { log "FATAL train memmap failed"; exit 5; }
   [ "$MODE" = "smoke" ] && TRAIN_OVERRIDES="--num-train-steps 200 --lr-schedule.warmup-steps 20 --save-interval 100 --log-interval 10 ${TRAIN_OVERRIDES:-}"
-  WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,stage2,yam_s2_train_v21,joint14_abs,horizon32,sagemaker,h100}
+  WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,stage2,$S2REPO,joint14_abs,horizon32,sagemaker,h100}
 else
 t_stage0=$(date +%s)
 # 1b. MODE=finetune: data = a prebuilt v2.1 repo cache (DATA_TRAIN_URI, must have <root>/_COMPLETE); init = a pretrain checkpoint

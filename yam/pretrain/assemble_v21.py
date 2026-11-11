@@ -9,6 +9,9 @@ the per-input rules:
   oopsie_<lab>   an oopsie-YAM unit export (18-D, padded): keep dims 0:14, cameras base_0_rgb/left_wrist_0_rgb/
                  right_wrist_0_rgb -> top/left_wrist/right_wrist; quality = `success` column; real
   absim          ABC-sim; quality from meta/episode_labels.jsonl by GLOBAL episode_index, trivial_success dropped; sim
+  absimteleop    ABC SIM TELEOP (abc_sim_v3ar): ONE merged v2.1 dir, built from the 24 v3.0 task repos by convert_source.py
+                 --keep-flags + stage-1 assemble; source absim_teleop, success, sim; nothing refused (the is_intervention
+                 fraction is printed and recorded when the column exists)
 Inputs with the same label must be adjacent (each source is one contiguous episode/frame range; the trainer's
 source-mix sampler reads those ranges from meta/assembly.json)."""
 import argparse
@@ -86,7 +89,7 @@ def do_repo_ep(job):
     for c_in, c in cams.items():
         d = root / f"videos/chunk-{ch:03d}/observation.images.{c}/episode_{new:06d}.mp4"; d.parent.mkdir(parents=True, exist_ok=True)
         link(in_root / f"videos/chunk-{ch_in:03d}/observation.images.{c_in}/episode_{old:06d}.mp4", d)
-    return n
+    return n, (int(t["is_intervention"].to_numpy().sum()) if "is_intervention" in t.column_names else -1)
 
 
 def _slice_stats(st, cams):
@@ -140,8 +143,11 @@ def repo_episodes(label, d, a):
         if a.absim_keep == "failure":  # policy "successes" are success_suboptimal: not teleop-grade, so they must not teach <quality=success>
             n1 = len(eps); eps = [e for e in eps if L[e["episode_index"]]["outcome"] == "failure"]; note += f"; kept failures only ({len(eps)} of {n1})"
         lab = lambda e: ("absim", Q[L[e["episode_index"]]["outcome"]], 1)
+    elif label == "absimteleop":
+        cams = {c: c for c in CAMS}
+        lab = lambda e: ("absim_teleop", 1, 1)
     else:
-        raise SystemExit(f"unknown --repo label {label!r} (abcmolmo | oopsie_<lab> | absim)")
+        raise SystemExit(f"unknown --repo label {label!r} (abcmolmo | oopsie_<lab> | absim | absimteleop)")
     if label in a.limit: eps = eps[: a.limit[label]]
     recs = []
     for e in eps:
@@ -171,12 +177,19 @@ def main_repos(a):
             assert s["first_new_episode"] + s["episodes"] == new, f"source {r['source']} is not contiguous (order the --repo inputs by source)"
             if d not in s["inputs"]: s["inputs"].append(d)
             s["episodes"] += 1; s["frames"] += r["length"]; s["success_episodes" if r["quality"] else "failure_episodes"] += 1
+            s.setdefault("task_episodes", {}).setdefault(r["task"], 0); s["task_episodes"][r["task"]] += 1
             jobs.append((r["dir"], r["chunks"], r["old"], new, frame0, tidx[r["task"]], r["source"], r["quality"], r["domain"], r["cams"], str(root)))
             episodes.append({"episode_index": new, "tasks": [r["task"]], "length": r["length"], "stats": r["stats"]})
             frame0 += r["length"]; new += 1
     for s in per_source.values(): s["end_new_episode"] = s["first_new_episode"] + s["episodes"]; s["end_frame"] = s["first_frame"] + s["frames"]
-    with ProcessPoolExecutor(a.workers) as ex: total = sum(ex.map(do_repo_ep, jobs, chunksize=64))
+    total, iv = 0, {}
+    with ProcessPoolExecutor(a.workers) as ex:
+        for job, (n, k) in zip(jobs, ex.map(do_repo_ep, jobs, chunksize=64)):
+            total += n
+            if k >= 0: c = iv.setdefault(job[6], [0, 0]); c[0] += k; c[1] += n
     assert total == frame0
+    for src, (k, n) in iv.items():  # information only (ABC sim teleop): frames flagged is_intervention in the inputs that have the column
+        per_source[src]["intervention_frac"] = round(k / n, 6); print(f"{src}: is_intervention on {k}/{n} frames ({k / n:.2%})")
     extra = {"source": {"dtype": "string", "shape": [1], "names": None}, "quality": {"dtype": "int64", "shape": [1], "names": None},
              "domain": {"dtype": "int64", "shape": [1], "names": None}}
     write_meta(root, a.robot_type, episodes, tasks, frame0, extra, codec="mixed (av1 / h264)",

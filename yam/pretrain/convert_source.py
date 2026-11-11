@@ -2,7 +2,9 @@
 """Stage A: LeRobot v3.0 repo (Zheyuan v3ar schema) -> per-episode v2.1-style files, keeping the SOURCE episode ids.
 Output <out>/ep_XXXXXX.parquet (14-D joints promoted to action/observation.state), ep_XXXXXX.<cam>.mp4 (lossless
 stream copy of the episode's packets; every episode starts on a keyframe in these files, verified), episodes.jsonl.
-Videos are cut with ffmpeg -ss <from_ts> -c copy -frames:v <len>; packet count is verified, mismatch -> re-encode fallback."""
+Videos are cut with ffmpeg -ss <from_ts> -c copy -frames:v <len>; packet count is verified, mismatch -> re-encode fallback.
+--keep-flags carries the per-frame bool columns is_demo / is_intervention (ABC sim) into the parquet when present; off by
+default so stage-1 outputs are unchanged (their info.json does not list the columns)."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 import glob
@@ -17,7 +19,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-CAMS = ("top", "left_wrist", "right_wrist")
+CAMS = ("top", "left_wrist", "right_wrist"); FLAGS = ("is_demo", "is_intervention")
 FF = os.environ.get("FFMPEG", "ffmpeg"); FP = os.environ.get("FFPROBE", "ffprobe")
 
 def nb_packets(p):
@@ -37,7 +39,7 @@ def stats_of(a):
     return {"min": a.min(0).tolist(), "max": a.max(0).tolist(), "mean": a.mean(0).tolist(), "std": a.std(0).tolist(), "count": [len(a)]}
 
 def do_file(args):
-    src, out, fps, rows, tasks = args   # rows: list of episode meta dicts sharing one data file
+    src, out, fps, rows, tasks, keep_flags = args   # rows: list of episode meta dicts sharing one data file
     src, out = Path(src), Path(out); done = []
     df_all = pq.read_table(src / rows[0]["data_path"]).to_pandas()
     for e in rows:
@@ -52,6 +54,9 @@ def do_file(args):
                                "index": np.zeros(n, np.int64), "task_index": np.zeros(n, np.int64)})
         schema = pa.schema([("action", pa.list_(pa.float32(), 14)), ("observation.state", pa.list_(pa.float32(), 14)), ("timestamp", pa.float32()),
                             ("frame_index", pa.int64()), ("episode_index", pa.int64()), ("index", pa.int64()), ("task_index", pa.int64())])
+        for k in FLAGS if keep_flags else ():
+            if k in df.columns:
+                out_df[k] = np.asarray(df[k].tolist(), bool).reshape(n); schema = schema.append(pa.field(k, pa.bool_()))
         pq.write_table(pa.Table.from_pandas(out_df, schema=schema, preserve_index=False), out / f"ep_{ei:06d}.parquet")
         modes = {}
         for c in CAMS:
@@ -62,14 +67,15 @@ def do_file(args):
     return done
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("src"); ap.add_argument("out"); ap.add_argument("--workers", type=int, default=32); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("src"); ap.add_argument("out"); ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--keep-flags", action="store_true", help="keep is_demo / is_intervention columns if present (ABC sim teleop)"); a = ap.parse_args()
     src, out = Path(a.src), Path(a.out); out.mkdir(parents=True, exist_ok=True)
     info = json.load(open(src / "meta/info.json")); fps = info["fps"]
     tasks = {int(r["task_index"]): r["task"] for r in pq.read_table(src / "meta/tasks.parquet").to_pylist()}
     eps = pd.concat([pq.read_table(p).to_pandas() for p in sorted(glob.glob(str(src / "meta/episodes/*/*.parquet")))])
     eps = eps[[c for c in eps.columns if not c.startswith("stats/")]]
     eps["data_path"] = [info["data_path"].format(chunk_index=int(r["data/chunk_index"]), file_index=int(r["data/file_index"])) for _, r in eps.iterrows()]
-    groups = [(str(src), str(out), fps, g.to_dict("records"), tasks) for _, g in eps.groupby("data_path")]
+    groups = [(str(src), str(out), fps, g.to_dict("records"), tasks, a.keep_flags) for _, g in eps.groupby("data_path")]
     t0 = time.time(); n = 0
     with ProcessPoolExecutor(a.workers) as ex:
         for done in ex.map(do_file, groups): n += len(done)
