@@ -24,8 +24,8 @@ def main():
     ap.add_argument("--workers", type=int, default=32)
     a = ap.parse_args()
     root = pathlib.Path(a.repo_root)
-    info = json.load(open(root / "meta/info.json"))
-    eps = [json.loads(l) for l in open(root / "meta/episodes.jsonl")]
+    info = json.loads((root / "meta/info.json").read_text())
+    eps = [json.loads(line) for line in (root / "meta/episodes.jsonl").read_text().splitlines()]
     eps.sort(key=lambda e: e["episode_index"])
     assert [e["episode_index"] for e in eps] == list(range(len(eps))), "episode indices must be 0..N-1"
     first = {}
@@ -35,8 +35,8 @@ def main():
         f0 += e["length"]
     assert f0 == info["total_frames"], (f0, info["total_frames"])
     with cf.ProcessPoolExecutor(a.workers) as ex:
-        rows = dict((r[0], r) for r in ex.map(_one, [(str(root), e["episode_index"], info["chunks_size"]) for e in eps], chunksize=64))
-    asm = json.load(open(root / "meta/assembly.json"))["sources"]
+        rows = {r[0]: r for r in ex.map(_one, [(str(root), e["episode_index"], info["chunks_size"]) for e in eps], chunksize=64)}
+    asm = json.loads((root / "meta/assembly.json").read_text())["sources"]
     for name, s in asm.items():  # episodes of a source are contiguous: check the range boundaries line up
         assert first[s["first_new_episode"]] == s["first_frame"], (name, first[s["first_new_episode"]], s["first_frame"])
         assert rows[s["first_new_episode"]][1] == name, (name, rows[s["first_new_episode"]])

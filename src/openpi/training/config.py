@@ -31,6 +31,8 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]  # src/openpi/training/config.py -> checkout root
+
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
@@ -108,9 +110,14 @@ class DataConfig:
     meta_prefix_field_dropout: bool = False
     # JSON {task string: canonical task string} applied before the prefix (yam/pretrain/absim_prompt_remap.json).
     prompt_remap_json: str | None = None
-    # LeRobot video timestamp tolerance (s). lerobot's 1e-4 kills a run on a stream-copied mp4 that is one frame short of
-    # its parquet (seen on converted ABC sim teleop, ep 60186); 0.05 accepts the nearest frame within ~1.5 frames at 30 fps.
-    video_tolerance_s: float = 0.05
+    # LeRobot video timestamp tolerance (s), lerobot's default. The stage-2/3 configs set 0.05: 1e-4 kills a run on a
+    # stream-copied mp4 that is one frame short of its parquet (converted ABC sim teleop, ep 60186); 0.05 accepts the
+    # nearest frame within ~1.5 frames at 30 fps. Opt-in because it also lets a repo with dropped frames load silently.
+    video_tolerance_s: float = 1e-4
+    # Wrap the LeRobot dataset in SkipBadSamples: a sample whose read fails (video decode / timestamp assertion) is
+    # replaced by a random other index (up to 8 retries, warned once per episode, counted in data/skipped_samples).
+    # Opt-in: it changes sampling on a corrupted repo, so a run that must fail loudly keeps the default.
+    skip_bad_samples: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -118,6 +125,10 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    def __post_init__(self) -> None:
+        if self.strata_mix and self.source_mix:
+            raise ValueError("set either strata_mix or source_mix, not both")
 
 
 class GroupFactory(Protocol):
@@ -691,8 +702,10 @@ _PI05_YAM_S3_META = TrainConfig(
             prompt_from_task=True,
             meta_prefix_dropout=0.3,
             meta_prefix_field_dropout=True,
-            prompt_remap_json=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "yam/pretrain/absim_prompt_remap.json"),
+            prompt_remap_json=str(_REPO_ROOT / "yam/pretrain/absim_prompt_remap.json"),
             state_dropout=0.1,
+            skip_bad_samples=True,
+            video_tolerance_s=0.05,
             strata_mix={"real_success": 0.30, "real_failure": 0.20, "sim_success": 0.30, "sim_failure": 0.20},
             strata_alpha=0.5,
             action_sequence_keys=("action",),
@@ -1102,6 +1115,8 @@ _CONFIGS = [
                     meta_prefix_dropout=meta_prefix_dropout,
                     state_dropout=0.1,
                     source_mix=source_mix,
+                    skip_bad_samples=True,
+                    video_tolerance_s=0.05,
                     action_sequence_keys=("action",),
                 ),
             ),
@@ -1135,12 +1150,7 @@ _CONFIGS = [
         )
         for name, meta_prefix_dropout in ((f"{prefix}_plain", None), (f"{prefix}_meta", 0.3))
     ],
-    # v3 (pi05_yam_s3_meta, 2026-11-03): same v2 repo, but (a) StratifiedMixSampler with batch shares fixed per
-    # domain x quality stratum (real_success .30 / real_failure .20 / sim_success .30 / sim_failure .20) and frames**0.5
-    # temperature inside a stratum (v2's equal lab slots gave AI2's 75 episodes 13 epochs while sim teleop got 0.07),
-    # (b) ABC-sim rollout prompts canonicalised to the 24 teleop task names so quality is not confounded with phrasing,
-    # (c) quality / domain prefix dropped independently (p=0.3 each) so inference can guide on one axis, (d) one cosine
-    # over 120k steps (no warm restart). Meta only: plain controls exist at v1/v2.
+    # v3 stage-3 meta config: rationale in the comment above _PI05_YAM_S3_META.
     _PI05_YAM_S3_META,
     # Sim-only twin of pi05_yam_s3_meta (2026-11-06): ABC-sim teleop : ABC-sim failures exactly 1:1 per batch, no real data.
     # Same warm start, prompt remap (quality must not be confounded with the rollout phrasing) and per-field dropout.

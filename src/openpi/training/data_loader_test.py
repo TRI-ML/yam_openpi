@@ -1,4 +1,6 @@
 import dataclasses
+import json
+import pathlib
 import types
 
 import jax
@@ -151,14 +153,15 @@ class _FlakyDataset:
 
 
 def test_skip_bad_samples():
-    ds = _data_loader.SkipBadSamples(_FlakyDataset({3}), count_key="data_skipped")
+    ds = _data_loader.SkipBadSamples(_FlakyDataset({3}))
     assert ds[2] == {"i": 2, "source": "abc", "data_skipped": 0}
     item = ds[3]
     assert item["i"] != 3
     assert item["data_skipped"] >= 1
     with pytest.raises(AssertionError):
         _data_loader.SkipBadSamples(_FlakyDataset(set(range(10))), max_retries=8)[0]
-    assert "data_skipped" not in _data_loader.SkipBadSamples(_FlakyDataset(set()))[0]
+    with pytest.raises(ValueError, match="not both"):
+        dataclasses.replace(_config.get_config("pi05_yam_s3_meta").data.base_config, source_mix={"absim": 1.0})
 
 
 def test_video_tolerance_passed(monkeypatch):
@@ -172,7 +175,9 @@ def test_video_tolerance_passed(monkeypatch):
         assert dc.video_tolerance_s == 0.05
         ds = _data_loader.create_torch_dataset(dc, 4, pi0_config.Pi0Config())
         assert seen["tolerance_s"] == 0.05
-        assert ds[0]["data_skipped"] == 0
+        assert ds[0]["data_skipped"] == 0  # stage-2 configs opt in to SkipBadSamples
+    plain = _data_loader.create_torch_dataset(dataclasses.replace(dc, skip_bad_samples=False), 4, pi0_config.Pi0Config())
+    assert "data_skipped" not in plain[0]  # default: no wrapper, a bad read raises
 
 
 def test_stratified_mix_sampler():
@@ -187,7 +192,9 @@ def test_stratified_mix_sampler():
     mix = {"real_success": 0.30, "real_failure": 0.20, "sim_success": 0.30, "sim_failure": 0.20}
     s = _data_loader.StratifiedMixSampler(eps, mix, num_samples=400_000, alpha=0.5, seed=0)
     idx = np.fromiter(iter(s), np.int64)
-    assert idx.min() >= 0 and idx.max() < f0 and len(idx) == 400_000
+    assert idx.min() >= 0
+    assert idx.max() < f0
+    assert len(idx) == 400_000
 
     def frac(a, b):
         return np.mean((idx >= a) & (idx < b))
@@ -214,7 +221,8 @@ def test_quality_domain_prefix_prompt_field_dropout():
     outs = [t({"task_index": 0, "index": i, "quality": 0, "domain": 1}) for i in range(4000)]
     q = np.mean([o["quality_dropped"] for o in outs])
     d = np.mean([o["domain_dropped"] for o in outs])
-    assert abs(q - 0.3) < 0.03 and abs(d - 0.3) < 0.03
+    assert abs(q - 0.3) < 0.03
+    assert abs(d - 0.3) < 0.03
     assert abs(np.mean([o["prefix_dropped"] for o in outs]) - (1 - 0.7 * 0.7)) < 0.03  # independent fields
     assert all(o["prompt"].endswith("pouring beads") and "sim pouring" not in o["prompt"] for o in outs)
     full = next(o for o in outs if not o["prefix_dropped"])
@@ -232,10 +240,12 @@ def test_quality_domain_prefix_prompt_field_dropout():
 def test_s3_config():
     c = _config.get_config("pi05_yam_s3_meta")
     b = c.data.base_config
-    assert abs(sum(b.strata_mix.values()) - 1.0) < 1e-9 and b.meta_prefix_field_dropout and b.source_mix is None
-    import json
-    remap = json.load(open(b.prompt_remap_json))
-    assert len(remap) == 1431 and set(remap.values()) <= {
+    assert abs(sum(b.strata_mix.values()) - 1.0) < 1e-9
+    assert b.meta_prefix_field_dropout
+    assert b.source_mix is None
+    remap = json.loads(pathlib.Path(b.prompt_remap_json).read_text())
+    assert len(remap) == 1431
+    assert set(remap.values()) <= {
         "grab clutter", "put relative", "pouring beads", "hang the mug on the mug rack", "turn the mug right side up",
         "throw plastic bottles in bin", "sweep away paper scraps from the table", "load the plates into the dish rack"}
     assert c.lr_schedule.decay_steps == c.num_train_steps == 120_000
@@ -251,12 +261,14 @@ def test_stratified_mix_sampler_sim_only():
     s = _data_loader.StratifiedMixSampler(eps, mix, num_samples=200_000, seed=0)
     idx = np.fromiter(iter(s), np.int64)
     assert idx.min() >= 1100  # real pools never drawn
-    assert abs(np.mean((idx >= 1100) & (idx < 4100)) - 0.5) < 0.01 and abs(np.mean(idx >= 4100) - 0.5) < 0.01
+    assert abs(np.mean((idx >= 1100) & (idx < 4100)) - 0.5) < 0.01
+    assert abs(np.mean(idx >= 4100) - 0.5) < 0.01
     assert s._names == ["sim_failure/absim", "sim_success/absim_teleop"]
     # a positive-share stratum that is absent is dropped (warning) and the rest renormalised
     s2 = _data_loader.StratifiedMixSampler([e for e in eps if e["source"] != "absim"], mix, num_samples=50_000, seed=0)
     idx2 = np.fromiter(iter(s2), np.int64)
-    assert idx2.min() >= 1100 and idx2.max() < 4100
+    assert idx2.min() >= 1100
+    assert idx2.max() < 4100
     with pytest.raises(ValueError, match="no stratum"):
         _data_loader.StratifiedMixSampler([e for e in eps if e["domain"] == 0], mix, num_samples=1)
 
@@ -265,5 +277,8 @@ def test_s3sim_config():
     c = _config.get_config("pi05_yam_s3sim_meta")
     b = c.data.base_config
     assert b.strata_mix == {"real_success": 0.0, "real_failure": 0.0, "sim_success": 0.5, "sim_failure": 0.5}
-    assert b.meta_prefix_field_dropout and b.prompt_remap_json and c.data.repo_id == "local/yam_s2v2_train_v21"
-    assert c.lr_schedule.decay_steps == c.num_train_steps == 120_000 and c.save_interval == 5_000
+    assert b.meta_prefix_field_dropout
+    assert b.prompt_remap_json
+    assert c.data.repo_id == "local/yam_s2v2_train_v21"
+    assert c.lr_schedule.decay_steps == c.num_train_steps == 120_000
+    assert c.save_interval == 5_000

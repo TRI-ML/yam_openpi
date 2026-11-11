@@ -77,15 +77,14 @@ class TransformedDataset(Dataset[T_co]):
 
 class SkipBadSamples(Dataset[T_co]):
     """Replaces a sample whose read fails (video decode / timestamp assertion) with a random other index, up to
-    `max_retries` times, then re-raises. Warns once per episode. With `count_key`, every item carries the number of
-    failed reads it replaced (summed by train.py into data/skipped_samples; a per-sample key works across loader workers)."""
+    `max_retries` times, then re-raises. Warns once per episode. Every item carries `data_skipped`, the number of failed
+    reads it replaced (summed by train.py into data/skipped_samples; a per-sample key works across loader workers)."""
 
     ERRORS = (AssertionError, ValueError, OSError, RuntimeError)
 
-    def __init__(self, dataset: Dataset, max_retries: int = 8, count_key: str | None = None):
+    def __init__(self, dataset: Dataset, max_retries: int = 8):
         self._dataset = dataset
         self._max_retries = max_retries
-        self._count_key = count_key
         self._warned: set[int] = set()
 
     def _episode(self, index: int) -> int:
@@ -106,9 +105,7 @@ class SkipBadSamples(Dataset[T_co]):
                     logging.warning(f"skipping sample {idx} (episode {ep}): {type(e).__name__}: {str(e)[:300]}")
                 idx = random.randrange(len(self._dataset))
                 continue
-            if self._count_key is not None:
-                item = {**item, self._count_key: np.int32(failed)}
-            return item
+            return {**item, "data_skipped": np.int32(failed)}
         raise AssertionError("unreachable")
 
     def __len__(self) -> int:
@@ -228,14 +225,49 @@ class YamLeRobotDataset(lerobot_dataset.LeRobotDataset):
 BATCH_EXTRA_KEYS = ("source_group", "prefix_dropped", "quality_dropped", "domain_dropped", "data_skipped")
 
 
-class SourceMixSampler(torch.utils.data.Sampler):
+class _PoolSampler(torch.utils.data.Sampler):
+    """Draws `num_samples` frame indices with replacement: pool i with probability `_p[i]`, then uniformly over that
+    pool's frames, given as a list of contiguous [a, b) ranges per pool. `set_epoch` reseeds so epochs differ."""
+
+    def __init__(self, ranges: list[list[tuple[int, int]]], p: np.ndarray, num_samples: int, seed: int):
+        self._starts = [np.asarray([a for a, _ in rr], np.int64) for rr in ranges]
+        self._lens = [np.asarray([b - a for a, b in rr], np.int64) for rr in ranges]
+        self._p = np.asarray(p, np.float64)
+        self._num_samples = num_samples
+        self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __iter__(self):
+        rng = np.random.default_rng([self._seed, self._epoch])
+        cums = [np.cumsum(n) - n for n in self._lens]
+        left = self._num_samples
+        while left > 0:
+            n = min(left, 1 << 20)
+            pool = rng.choice(len(self._p), size=n, p=self._p)
+            out = np.empty(n, np.int64)
+            for i in range(len(self._p)):
+                sel = np.flatnonzero(pool == i)
+                u = rng.integers(0, self._lens[i].sum(), size=len(sel))  # uniform over the pool's frames
+                j = np.searchsorted(cums[i], u, side="right") - 1
+                out[sel] = self._starts[i][j] + (u - cums[i][j])
+            yield from out.tolist()
+            left -= n
+
+
+class SourceMixSampler(_PoolSampler):
     """Samples frame indices of a stage-2 repo by SOURCE weight instead of frame count (with replacement).
 
     `mix` keys match the `source` labels of <repo>/meta/assembly.json (each source one contiguous frame range):
     "abc+molmo" = one pool, frames drawn uniformly over the union (frame-proportional inside); a glob such as
     "oopsie_*" = its weight split equally over the matching sources (balances labs). Every source must be matched by
     exactly one key; keys matching nothing present are dropped with a warning and the rest renormalised (smoke repos).
-    One epoch = `num_samples` draws; `set_epoch` reseeds so epochs differ."""
+    One epoch = `num_samples` draws."""
 
     def __init__(self, sources: dict, mix: dict[str, float], num_samples: int, seed: int = 0):
         ranges, weights, owner, names = [], [], {}, []
@@ -258,11 +290,7 @@ class SourceMixSampler(torch.utils.data.Sampler):
                 weights.append(w / len(groups))
         if missing := set(sources) - set(owner):
             raise ValueError(f"sources {sorted(missing)} are not covered by the source mix {mix}")
-        self._ranges = ranges
-        self._p = np.asarray(weights, np.float64) / np.sum(weights)
-        self._num_samples = num_samples
-        self._seed = seed
-        self._epoch = 0
+        super().__init__(ranges, np.asarray(weights) / np.sum(weights), num_samples, seed)
         logging.info(
             "source mix (pool -> sample share): %s",
             {n: round(float(p), 4) for n, p in zip(names, self._p, strict=True)},
@@ -276,31 +304,8 @@ class SourceMixSampler(torch.utils.data.Sampler):
         logging.info(f"source mix over {root}: { {k: v['frames'] for k, v in sources.items()} } frames")
         return cls(sources, mix, num_samples, seed)
 
-    def set_epoch(self, epoch: int) -> None:
-        self._epoch = epoch
 
-    def __len__(self) -> int:
-        return self._num_samples
-
-    def __iter__(self):
-        rng = np.random.default_rng([self._seed, self._epoch])
-        left = self._num_samples
-        while left > 0:
-            n = min(left, 1 << 20)
-            pool = rng.choice(len(self._ranges), size=n, p=self._p)
-            out = np.empty(n, np.int64)
-            for i, rr in enumerate(self._ranges):
-                sel = np.flatnonzero(pool == i)
-                lens = np.asarray([b - a for a, b in rr], np.int64)
-                u = rng.integers(0, lens.sum(), size=len(sel))  # uniform over the pool's frames
-                cum = np.cumsum(lens) - lens
-                j = np.searchsorted(cum, u, side="right") - 1
-                out[sel] = np.asarray([a for a, _ in rr], np.int64)[j] + (u - cum[j])
-            yield from out.tolist()
-            left -= n
-
-
-class StratifiedMixSampler(torch.utils.data.Sampler):
+class StratifiedMixSampler(_PoolSampler):
     """Stage-3 sampler: batch shares fixed per STRATUM (domain x quality), temperature-weighted inside.
 
     `strata_mix` keys are "real_success" / "real_failure" / "sim_success" / "sim_failure"; inside a stratum every
@@ -329,17 +334,15 @@ class StratifiedMixSampler(torch.utils.data.Sampler):
         if not pools:
             raise ValueError(f"no stratum with positive share is present in the repo: {strata_mix}")
         z = sum(w for st, w in strata_mix.items() if st in {s2 for s2, _ in pools})
-        self._starts, self._lens, self._p, self._names, frames = [], [], [], [], []
+        ranges, p, self._names, frames = [], [], [], []
         for (st, src), rr in sorted(pools.items()):
             n = sum(b - a for a, b in rr)
             within = n**alpha / sum(sum(b - a for a, b in r2) ** alpha for (st2, _), r2 in pools.items() if st2 == st)
-            self._starts.append(np.asarray([a for a, _ in rr], np.int64))
-            self._lens.append(np.asarray([b - a for a, b in rr], np.int64))
-            self._p.append(strata_mix[st] / z * within)
+            ranges.append(rr)
+            p.append(strata_mix[st] / z * within)
             self._names.append(f"{st}/{src}")
             frames.append(n)
-        self._p = np.asarray(self._p, np.float64)
-        self._num_samples, self._seed, self._epoch = num_samples, seed, 0
+        super().__init__(ranges, p, num_samples, seed)
         tot = total_samples or num_samples
         logging.info("strata mix (stratum/source -> share, frames, expected epochs over %d samples):", tot)
         for name, p, n in zip(self._names, self._p, frames, strict=True):
@@ -352,28 +355,6 @@ class StratifiedMixSampler(torch.utils.data.Sampler):
         with open(root / "meta/episode_strata.jsonl") as f:
             episodes = [json.loads(line) for line in f]
         return cls(episodes, strata_mix, num_samples, alpha=alpha, seed=seed, total_samples=total_samples)
-
-    def set_epoch(self, epoch: int) -> None:
-        self._epoch = epoch
-
-    def __len__(self) -> int:
-        return self._num_samples
-
-    def __iter__(self):
-        rng = np.random.default_rng([self._seed, self._epoch])
-        cums = [np.cumsum(l) - l for l in self._lens]
-        left = self._num_samples
-        while left > 0:
-            n = min(left, 1 << 20)
-            pool = rng.choice(len(self._p), size=n, p=self._p)
-            out = np.empty(n, np.int64)
-            for i in range(len(self._p)):
-                sel = np.flatnonzero(pool == i)
-                u = rng.integers(0, self._lens[i].sum(), size=len(sel))  # uniform over the pool's frames
-                j = np.searchsorted(cums[i], u, side="right") - 1
-                out[sel] = self._starts[i][j] + (u - cums[i][j])
-            yield from out.tolist()
-            left -= n
 
 
 def make_lerobot_dataset(
@@ -433,6 +414,14 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    remap = None
+    if data_config.prompt_remap_json:  # read before the (slow) dataset load so a missing file fails at once
+        try:
+            remap = json.loads(pathlib.Path(data_config.prompt_remap_json).read_text())
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"{e}: the stage-3 configs derive prompt_remap_json from config.py's location "
+                                    "(yam/pretrain/absim_prompt_remap.json); outside the full checkout point it at a copy") from e
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = make_lerobot_dataset(
         data_config.repo_id,
@@ -441,15 +430,12 @@ def create_torch_dataset(
         },
         tolerance_s=data_config.video_tolerance_s,
     )
-    # The skip counter rides along only on stage-2 repos (the ones with per-sample extras); others just retry.
-    dataset = SkipBadSamples(dataset, count_key="data_skipped" if "source" in dataset_meta.features else None)
+    if data_config.skip_bad_samples:
+        dataset = SkipBadSamples(dataset)
 
     if data_config.prompt_from_task:
         if data_config.meta_prefix_dropout is not None:
-            remap = None
-            if data_config.prompt_remap_json:
-                with open(data_config.prompt_remap_json) as f:
-                    remap = json.load(f)
+            if remap is not None:
                 hit = sum(t in remap for t in dataset_meta.tasks.values())
                 logging.info(f"prompt remap {data_config.prompt_remap_json}: {hit} of {len(dataset_meta.tasks)} task strings remapped")
             prompt = _transforms.QualityDomainPrefixPrompt(dataset_meta.tasks, dropout_p=data_config.meta_prefix_dropout,
