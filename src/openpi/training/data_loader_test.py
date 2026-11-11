@@ -233,7 +233,7 @@ def test_s3_config():
     c = _config.get_config("pi05_yam_s3_meta")
     b = c.data.base_config
     assert abs(sum(b.strata_mix.values()) - 1.0) < 1e-9 and b.meta_prefix_field_dropout and b.source_mix is None
-    import json, pathlib
+    import json
     remap = json.load(open(b.prompt_remap_json))
     assert len(remap) == 1431 and set(remap.values()) <= {
         "grab clutter", "put relative", "pouring beads", "hang the mug on the mug rack", "turn the mug right side up",
