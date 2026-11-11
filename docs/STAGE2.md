@@ -302,6 +302,12 @@ of the B") differed in phrasing from the 24 teleop task names, so `<quality=fail
 - **Prompt remap** `yam/pretrain/absim_prompt_remap.json` (`data_config.prompt_remap_json`): all 1,431 ABC-sim rollout prompts ->
   8 teleop task names (6 `sim ...` -> their teleop name, `grab the … box` -> `grab clutter`, `put the A <rel> the B` -> `put relative`).
   Applied in `QualityDomainPrefixPrompt`, the cache's `tasks.jsonl` is not edited.
+  The path in the config is derived from `config.py`'s location; the loader fails at once with `FileNotFoundError` if the
+  file is not in the checkout.
+- **Loader robustness** (opt-in, set on the stage-2/3 configs only): `video_tolerance_s=0.05` (lerobot's 1e-4 killed the run on a
+  stream-copied mp4 one frame short of its parquet, ep 60186) and `skip_bad_samples=True` (`SkipBadSamples`: a failed read is
+  replaced by a random other index, up to 8 tries, warned once per episode, counted as `data/skipped_samples`). Other configs keep
+  lerobot's defaults and fail loudly.
 - **Dropout** `meta_prefix_field_dropout=True`: quality and domain dropped independently (p=0.3 each) so inference can guide on
   one axis; telemetry `prefix/quality_dropped_frac`, `prefix/domain_dropped_frac`, `prefix/dropped_frac` (= 1-0.7^2 = 0.51).
 - **Schedule**: one cosine 500 warmup 1e-5 -> 1e-6 over 120k steps, batch 128 (no warm restart). Meta model only.

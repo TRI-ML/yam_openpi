@@ -73,6 +73,7 @@ if [ $S2 = 1 ]; then
     log "fetched in $(( $(date +%s)-t0 ))s"; df -h $W | tail -1
   fi
   [ -f $TRAIN/meta/assembly.json ] || { log "FATAL $TRAIN/meta/assembly.json missing"; exit 2; }
+  case $CFG in pi05_yam_s3*) [ -f $TRAIN/meta/episode_strata.jsonl ] || { log "FATAL $TRAIN/meta/episode_strata.jsonl missing (yam/pretrain/build_episode_strata.py)"; exit 2; };; esac
   [ -f $TRAIN/lowdim_mm/action.npy ] || $PY $S/build_lowdim_memmap.py $TRAIN --workers 48 >> $W/logs/memmap.log 2>&1 || { log "FATAL train memmap failed"; exit 5; }
   [ "$MODE" = "smoke" ] && TRAIN_OVERRIDES="--num-train-steps 200 --lr-schedule.warmup-steps 20 --save-interval 100 --log-interval 10 ${TRAIN_OVERRIDES:-}"
   WANDB_TAGS=${WANDB_TAGS:-pi05,full_ft,pretrain,yam,stage2,$S2REPO,joint14_abs,horizon32,sagemaker,h100}
